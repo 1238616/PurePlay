@@ -1,4 +1,6 @@
 # PurePlay
+<img width="840" height="1626" alt="image" src="https://github.com/user-attachments/assets/bce3fb85-f00e-4f76-a873-f3b826339e6c" />
+
 
 > macOS-native, bit-perfect Hi-Res music player — DSD/DoP, Quark cloud streaming, full library tooling, visible signal path.
 
