@@ -6,7 +6,7 @@ A SwiftPM package combining a Vox-inspired minimal dark UI with audiophile-grade
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  PurePlay  v1.4.11                                       │
+│  PurePlay  v1.5.31                                       │
 ├──────────────────────────────────────────────────────────┤
 │            ┌───────────────────────────────┐             │
 │            │                               │             │
@@ -69,7 +69,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 - **Gapless playback** — `AudioPipeline.swapDecoder(_:)` exchanges decoders mid-flight when formats match; `PlayerController.tryGaplessAdvance()` automatically wires this for the queue.
 - **DAC capability probe** — `DACCapabilityProbe` cross-references `AvailableNominalSampleRates` with the bundled 40-DAC whitelist (`Resources/KnownDSDDevices.json`).
 
-### Decoders (7 formats, +FFmpeg slot)
+### Decoders (8 formats + FFmpeg universal fallback)
 | Decoder              | Library                | Notes                                                  |
 | -------------------- | ---------------------- | ------------------------------------------------------ |
 | `WAVDecoder`         | self-implemented       | PCM 16/24/32 + IEEE float; RF64 large-file support     |
@@ -79,6 +79,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 | `ALACDecoderFactory` | CoreAudio              | dedicated `.alac/.m4a/.mp4` priority 95                |
 | `CoreAudioDecoder`   | CoreAudio fallback     | `.flac/.mp3/.aac/.caf/.ogg`                            |
 | `LibFLACDecoder`     | libFLAC (xcframework)  | activates when `CFLAC` is available, priority 100      |
+| `FFmpegDecoder`      | FFmpeg (shipped dylib) | universal fallback: APE, WMA, Opus, Vorbis, WavPack, TTA, Matroska via custom AVIO |
 | `CueSheet` parser    | self-implemented       | one-FILE multi-TRACK split via `TrimmingDecoder`       |
 | FLAC MD5 verifier    | self-implemented       | parses STREAMINFO, validates the embedded MD5 hash     |
 
@@ -140,7 +141,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 
 ### Install pre-built DMG
 ```sh
-open dist/PurePlay-1.4.11-Installer.dmg
+open dist/PurePlay-1.5.31-Installer.dmg
 
 # Ad-hoc-signed builds need quarantine cleared on first launch:
 xattr -dr com.apple.quarantine /Applications/PurePlay.app
@@ -148,8 +149,8 @@ xattr -dr com.apple.quarantine /Applications/PurePlay.app
 
 ### Build from source
 ```sh
-git clone <repo>
-cd localplayer
+git clone https://github.com/1238616/PurePlay.git
+cd PurePlay
 swift build -c release --product PurePlay
 open .build/release/PurePlay.app
 ```
@@ -297,12 +298,17 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `Decoder/CoreAudioDecoder.swift`    | ExtAudioFile path                                      |
 | `Decoder/LibFLACDecoder.swift`      | libFLAC binding (`#if canImport(CFLAC)`)               |
 | `Decoder/FLACMetadata.swift`        | STREAMINFO + Vorbis Comments + MD5 verifier            |
+| `Decoder/FFmpegDecoder.swift`       | FFmpeg universal decoder (shipped dylibs)              |
+| `Decoder/FFmpegAVIOAdapter.swift`   | Custom AVIO context bridging Swift I/O to FFmpeg       |
+| `Decoder/FFmpegSampleFormatSelector.swift` | Optimal sample format negotiation for FFmpeg   |
 | `DSD/DoPPacker.swift`               | DSD-over-PCM marker injection                          |
 | `DSD/DSD2PCMConverter.swift`        | Gesemann 96-tap FIR                                    |
 | `DSD/DACCapabilityProbe.swift`      | Per-device DSD support detection                       |
 | `DSP/DSPChain.swift`                | Auto-assembled node chain                              |
 | `DSP/DSPNodes.swift`                | Gain / BiquadEQ / Crossfeed / Dither                   |
 | `DSP/SincResampler.swift`           | Kaiser-windowed Sinc resampler                         |
+| `DSP/EQPresetManager.swift`         | JSON-loaded EQ preset management                       |
+| `DSP/AutoEQParser.swift`            | AutoEQ headphone correction parser                     |
 | `Output/AudioOutput.swift`          | `CoreAudioHALOutput` + protocol                        |
 | `Output/AudioDeviceListener.swift`  | 4-class CoreAudio listener                             |
 | `Output/SampleRateManager.swift`    | Switch + poll-confirm                                  |
@@ -314,6 +320,7 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `Database/DatabaseManager.swift`    | Migrations v1/v2/v3 + FTS5 search                      |
 | `Metadata/MetadataReader.swift`     | AVAsset tag extraction                                 |
 | `Metadata/CoverArtManager.swift`    | Embedded + folder scan cache                           |
+| `Metadata/ReplayGainReader.swift`   | ReplayGain tag extraction (track + album gain)         |
 | `Cloud/QuarkAPIClient.swift`        | Authenticated REST + `onAuthExpired`                   |
 | `Cloud/CloudStreamSource.swift`     | Sparse-chunk Range-fetch stream                        |
 | `Cloud/CloudHeaderProber.swift`     | 64KB magic-byte format probe                           |
@@ -332,6 +339,7 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `WaveformView.swift`          | Scrolling waveform (Core Graphics)                     |
 | `SpectrumView.swift`          | CVDisplayLink FFT visualizer                           |
 | `EQCurveEditor.swift`         | Draggable 10-band EQ curve                             |
+| `ParametricEQEditor.swift`    | Parametric EQ band editor                              |
 | `EQPanel.swift`               | EQ settings window                                     |
 | `MiniPlayerWindow.swift`      | Floating compact player                                |
 | `DSDBadgeView.swift`          | Golden DSD badge                                       |
@@ -526,6 +534,7 @@ localplayer/
 ├── README.md              # this file
 ├── Package.swift          # SwiftPM manifest
 ├── Package.resolved
+├── LICENSE                # GPL 3.0
 ├── VERSION                # SemVer source of truth
 │
 ├── Sources/
@@ -546,14 +555,22 @@ localplayer/
 │
 ├── scripts/
 │   ├── build_release.sh        # version bump + sign + DMG + dSYM
+│   ├── build_ffmpeg.sh         # build FFmpeg dylibs from source
 │   ├── notarize.sh             # Apple notarization + stapling
 │   ├── perf_bench.sh           # launch / RSS / CPU baseline
 │   ├── build_libflac.sh        # optional libFLAC xcframework
 │   ├── build_soxr.sh           # optional libsoxr xcframework
 │   └── pureplay.rb             # Homebrew Cask formula template
 │
-├── Frameworks/                 # (generated) optional xcframeworks
-└── dist/                       # generated DMG + app + dSYM
+├── Frameworks/
+│   └── FFmpeg/                 # shipped FFmpeg headers + dylibs (arm64)
+│
+├── Modules/
+│   └── CFFmpeg/                # Swift module map for FFmpeg C interop
+│
+├── docs/                       # PRD, ADRs, issue tracking
+│
+└── dist/                       # (gitignored) generated DMG + app + dSYM
 ```
 
 ---
@@ -571,7 +588,7 @@ localplayer/
 | UI    | ✅      | SignalPathBar + WaveformView + MiniPlayer + EQCurveEditor   |
 | G     | ✅      | EQPanel + Cookie auto re-login + NowPlayingViewModel        |
 | S1-S3 | ✅      | 18 bug fixes: volume, stop race, chunk eviction, retry backoff, thread safety, EQ persistence, stress tests (210 total) |
-| Next  | ⏳      | FFmpeg LGPL xcframework (APE / Opus / Vorbis / WavPack / TTA) |
+| M6    | ✅      | FFmpeg dylib + custom AVIO (APE / Opus / Vorbis / WavPack / TTA / WMA / Matroska) |
 | Next  | ⏳      | taglib integration replacing AVAsset metadata reader        |
 | Next  | ⏳      | TechBadgeView (generic sample-rate / bit-depth / format badge) |
 | Next  | ⏳      | MenuBarPopover replacing NSMenu status item                 |
@@ -581,9 +598,12 @@ localplayer/
 
 ## License
 
-Internal project — not currently published. All rights reserved by the author.
+PurePlay is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for details.
 
 Third-party software:
 - [GRDB.swift](https://github.com/groue/GRDB.swift) — MIT
 - [swift-atomics](https://github.com/apple/swift-atomics) — Apache-2.0
+- [FFmpeg](https://ffmpeg.org/) (shipped dylibs) — LGPL 2.1
 - Optional: [libFLAC](https://xiph.org/flac/) — BSD; [SoXR](https://sourceforge.net/projects/soxr/) — LGPL
