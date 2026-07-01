@@ -1,0 +1,119 @@
+{
+  "version": 2,
+  "description": "Built-in EQ presets. Version 2 adds parametric band definitions alongside legacy gains. Frequencies in Hz, gains in dB clamped to [-24, +24]. Preamp applied before EQ processing.",
+  "bands": [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+  "presets": [
+    {
+      "name": "Flat",
+      "description": "Reference / no coloration",
+      "preamp": 0,
+      "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "parametric": []
+    },
+    {
+      "name": "Bass Boost",
+      "description": "Subtle low-end warmth (+3..+6dB below 250Hz)",
+      "preamp": -2,
+      "gains": [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+      "parametric": [
+        {"type": "peaking", "freq": 31, "gain": 6, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 62, "gain": 5, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 125, "gain": 4, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 250, "gain": 2, "q": 1.414, "enabled": true}
+      ]
+    },
+    {
+      "name": "Treble Boost",
+      "description": "Air and shimmer (+3..+6dB above 4kHz)",
+      "preamp": -2,
+      "gains": [0, 0, 0, 0, 0, 0, 2, 4, 5, 6],
+      "parametric": [
+        {"type": "peaking", "freq": 2000, "gain": 2, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 4000, "gain": 4, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 8000, "gain": 5, "q": 1.414, "enabled": true},
+        {"type": "highShelf", "freq": 10000, "gain": 6, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Vocal Forward",
+      "description": "Lift presence range 1-4kHz; tame 250Hz boxy zone",
+      "preamp": -1,
+      "gains": [0, 0, -1, -2, -1, 1, 3, 3, 1, 0],
+      "parametric": [
+        {"type": "peaking", "freq": 250, "gain": -2, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 1000, "gain": 1, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 2000, "gain": 3, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 4000, "gain": 3, "q": 1.414, "enabled": true}
+      ]
+    },
+    {
+      "name": "Classical",
+      "description": "Smooth, slightly recessed mids, natural treble",
+      "preamp": 0,
+      "gains": [2, 2, 1, 0, -1, -2, -1, 0, 1, 2],
+      "parametric": [
+        {"type": "lowShelf", "freq": 80, "gain": 2, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 500, "gain": -1, "q": 1.0, "enabled": true},
+        {"type": "peaking", "freq": 1000, "gain": -2, "q": 1.0, "enabled": true},
+        {"type": "highShelf", "freq": 8000, "gain": 2, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Jazz",
+      "description": "Warm bass, slightly rolled-off treble",
+      "preamp": -1,
+      "gains": [3, 2, 1, 1, 0, -1, -1, 0, 1, 1],
+      "parametric": [
+        {"type": "lowShelf", "freq": 100, "gain": 3, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 1000, "gain": -1, "q": 1.0, "enabled": true},
+        {"type": "highShelf", "freq": 8000, "gain": 1, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Electronic",
+      "description": "Punchy sub-bass + sparkly highs",
+      "preamp": -3,
+      "gains": [5, 4, 1, -1, -2, 0, 2, 3, 4, 5],
+      "parametric": [
+        {"type": "lowShelf", "freq": 60, "gain": 5, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 250, "gain": -1, "q": 1.414, "enabled": true},
+        {"type": "peaking", "freq": 500, "gain": -2, "q": 1.414, "enabled": true},
+        {"type": "highShelf", "freq": 6000, "gain": 5, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Rock",
+      "description": "V-shaped: bass + treble lifted, slight mid scoop",
+      "preamp": -2,
+      "gains": [4, 3, 2, -1, -2, -1, 1, 3, 4, 4],
+      "parametric": [
+        {"type": "lowShelf", "freq": 80, "gain": 4, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 500, "gain": -2, "q": 1.0, "enabled": true},
+        {"type": "highShelf", "freq": 4000, "gain": 4, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Pop",
+      "description": "Mild vocal clarity boost",
+      "preamp": -1,
+      "gains": [2, 1, 0, 1, 2, 2, 1, 0, 1, 2],
+      "parametric": [
+        {"type": "lowShelf", "freq": 60, "gain": 2, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 500, "gain": 2, "q": 1.0, "enabled": true},
+        {"type": "peaking", "freq": 1000, "gain": 2, "q": 1.0, "enabled": true},
+        {"type": "highShelf", "freq": 10000, "gain": 2, "q": 0.707, "enabled": true}
+      ]
+    },
+    {
+      "name": "Hi-Fi Loudness",
+      "description": "Equal-loudness compensation at low listening levels",
+      "preamp": -3,
+      "gains": [6, 4, 2, 0, 0, 0, 0, 1, 3, 5],
+      "parametric": [
+        {"type": "lowShelf", "freq": 50, "gain": 6, "q": 0.707, "enabled": true},
+        {"type": "peaking", "freq": 125, "gain": 2, "q": 1.0, "enabled": true},
+        {"type": "highShelf", "freq": 8000, "gain": 5, "q": 0.707, "enabled": true}
+      ]
+    }
+  ]
+}

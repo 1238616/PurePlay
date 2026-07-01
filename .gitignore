@@ -1,0 +1,17 @@
+# Swift build artifacts
+.build/
+
+# Distribution / release binaries
+dist/
+
+# macOS metadata
+.DS_Store
+
+# Tool-local settings (contain machine-specific paths)
+.qoder/
+.claude/
+
+# Xcode
+*.xcodeproj/xcuserdata/
+DerivedData/
+*.xcworkspace/xcuserdata/

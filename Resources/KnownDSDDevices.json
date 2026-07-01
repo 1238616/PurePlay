@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "description": "Curated list of macOS-compatible USB DACs with confirmed DSD over DoP support. Used by DACCapabilityProbe to identify supported DSD rates when CoreAudio sample rate enumeration is unreliable. Match is case-insensitive substring of the device name returned by CoreAudio.",
+  "devices": [
+    { "nameSubstring": "ADI-2",          "vendor": "RME",        "maxDSD": "DSD256" },
+    { "nameSubstring": "Babyface",       "vendor": "RME",        "maxDSD": "DSD128" },
+    { "nameSubstring": "Fireface",       "vendor": "RME",        "maxDSD": "DSD128" },
+
+    { "nameSubstring": "Modi Multibit",  "vendor": "Schiit",     "maxDSD": "DSD64"  },
+    { "nameSubstring": "Bifrost 2",      "vendor": "Schiit",     "maxDSD": "DSD64"  },
+    { "nameSubstring": "Gungnir",        "vendor": "Schiit",     "maxDSD": "DSD64"  },
+    { "nameSubstring": "Yggdrasil",      "vendor": "Schiit",     "maxDSD": "DSD64"  },
+
+    { "nameSubstring": "D90",            "vendor": "Topping",    "maxDSD": "DSD512" },
+    { "nameSubstring": "D70",            "vendor": "Topping",    "maxDSD": "DSD512" },
+    { "nameSubstring": "D50",            "vendor": "Topping",    "maxDSD": "DSD512" },
+    { "nameSubstring": "D30",            "vendor": "Topping",    "maxDSD": "DSD256" },
+    { "nameSubstring": "DX7",            "vendor": "Topping",    "maxDSD": "DSD512" },
+    { "nameSubstring": "E30",            "vendor": "Topping",    "maxDSD": "DSD256" },
+
+    { "nameSubstring": "SU-9",           "vendor": "SMSL",       "maxDSD": "DSD512" },
+    { "nameSubstring": "M500",           "vendor": "SMSL",       "maxDSD": "DSD512" },
+    { "nameSubstring": "M400",           "vendor": "SMSL",       "maxDSD": "DSD512" },
+    { "nameSubstring": "M300",           "vendor": "SMSL",       "maxDSD": "DSD256" },
+    { "nameSubstring": "DO100",          "vendor": "SMSL",       "maxDSD": "DSD512" },
+
+    { "nameSubstring": "iDSD",           "vendor": "iFi",        "maxDSD": "DSD512" },
+    { "nameSubstring": "Zen DAC",        "vendor": "iFi",        "maxDSD": "DSD256" },
+    { "nameSubstring": "xDSD",           "vendor": "iFi",        "maxDSD": "DSD256" },
+    { "nameSubstring": "Pro iDSD",       "vendor": "iFi",        "maxDSD": "DSD512" },
+
+    { "nameSubstring": "Mojo",           "vendor": "Chord",      "maxDSD": "DSD256" },
+    { "nameSubstring": "Hugo",           "vendor": "Chord",      "maxDSD": "DSD512" },
+    { "nameSubstring": "Qutest",         "vendor": "Chord",      "maxDSD": "DSD512" },
+    { "nameSubstring": "TT 2",           "vendor": "Chord",      "maxDSD": "DSD512" },
+
+    { "nameSubstring": "DacMagic",       "vendor": "Cambridge",  "maxDSD": "DSD256" },
+    { "nameSubstring": "CXN",            "vendor": "Cambridge",  "maxDSD": "DSD256" },
+
+    { "nameSubstring": "Pro-Ject",       "vendor": "Pro-Ject",   "maxDSD": "DSD256" },
+    { "nameSubstring": "Cocktail Audio", "vendor": "Novatron",   "maxDSD": "DSD512" },
+
+    { "nameSubstring": "Bryston BDA",    "vendor": "Bryston",    "maxDSD": "DSD256" },
+    { "nameSubstring": "Mytek Brooklyn", "vendor": "Mytek",      "maxDSD": "DSD256" },
+    { "nameSubstring": "Mytek Manhattan","vendor": "Mytek",      "maxDSD": "DSD512" },
+
+    { "nameSubstring": "ES9038",         "vendor": "ESS",        "maxDSD": "DSD512" },
+    { "nameSubstring": "ES9028",         "vendor": "ESS",        "maxDSD": "DSD512" },
+    { "nameSubstring": "ES9018",         "vendor": "ESS",        "maxDSD": "DSD256" },
+
+    { "nameSubstring": "AK4499",         "vendor": "AKM",        "maxDSD": "DSD512" },
+    { "nameSubstring": "AK4497",         "vendor": "AKM",        "maxDSD": "DSD512" },
+    { "nameSubstring": "AK4493",         "vendor": "AKM",        "maxDSD": "DSD256" },
+
+    { "nameSubstring": "DragonFly",      "vendor": "AudioQuest", "maxDSD": "DSD64"  },
+    { "nameSubstring": "Cobalt",         "vendor": "AudioQuest", "maxDSD": "DSD64"  }
+  ]
+}
