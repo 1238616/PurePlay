@@ -126,7 +126,7 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     /// 添加本地文件 URL
     func addURLs(_ urls: [URL]) {
         let audioExtensions: Set<String> = ["flac","ape","wav","aiff","aif","dsf","dff",
-                                             "alac","m4a","mp3","ogg","opus","wv","mp4","aac","caf"]
+                                             "alac","m4a","mp3","ogg","opus","wv","mp4","aac","caf","dts"]
         for url in urls {
             if url.hasDirectoryPath {
                 if let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: nil) {

@@ -342,7 +342,7 @@ public final class FFmpegDecoder: AudioDecoder {
 
 public enum FFmpegDecoderFactory: DecoderFactory {
     public static let supportedExtensions: Set<String> = [
-        "ape", "wv", "tta", "opus", "ogg", "wma", "mka"
+        "ape", "wv", "tta", "opus", "ogg", "wma", "mka", "dts"
     ]
     public static let priority: Int = 80
 

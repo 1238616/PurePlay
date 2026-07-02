@@ -11,7 +11,8 @@ struct ScanResult {
 final class IncrementalScanner {
     private let audioExtensions: Set<String> = [
         "flac", "wav", "aiff", "aif", "alac", "m4a",
-        "mp3", "aac", "ogg", "opus", "wma", "dsf", "dff"
+        "mp3", "aac", "ogg", "opus", "wma", "dsf", "dff",
+        "ape", "wv", "tta", "dts"
     ]
     
     private let databaseManager: DatabaseManager

@@ -22,7 +22,7 @@ public enum CloudHeaderProber {
 
     public enum DetectedFormat: String, Sendable {
         case wav, flac, aiff, aifc, dsf, dff
-        case mp3, m4a, ogg
+        case mp3, m4a, ogg, dts
         case unknown
     }
 
@@ -84,6 +84,14 @@ public enum CloudHeaderProber {
         // M4A / MP4 (ISO base media): bytes 4..8 == "ftyp"
         if b.count >= 12 && matches(b, 4, ascii: "ftyp") {
             return ProbeResult(format: .m4a, extensionHint: "m4a", audioFormat: nil)
+        }
+        // DTS core sync word (big-endian): 0x7FFE 0x8001
+        if b.count >= 4 && b[0] == 0x7F && b[1] == 0xFE && b[2] == 0x80 && b[3] == 0x01 {
+            return ProbeResult(format: .dts, extensionHint: "dts", audioFormat: nil)
+        }
+        // DTS core sync word (little-endian byte-swap): 0xFE7F 0x0180
+        if b.count >= 4 && b[0] == 0xFE && b[1] == 0x7F && b[2] == 0x01 && b[3] == 0x80 {
+            return ProbeResult(format: .dts, extensionHint: "dts", audioFormat: nil)
         }
         return ProbeResult(format: .unknown, extensionHint: "", audioFormat: nil)
     }

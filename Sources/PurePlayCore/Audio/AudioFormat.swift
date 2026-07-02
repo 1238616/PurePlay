@@ -95,6 +95,7 @@ public enum AudioFileFormat: String, CaseIterable, Sendable {
     case wavpack = "wv"
     case tta
     case wma, mka, aac
+    case dts
     case unknown
 
     public static func from(fileExtension ext: String) -> AudioFileFormat {
