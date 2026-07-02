@@ -8,7 +8,7 @@ A SwiftPM package combining a Vox-inspired minimal dark UI with audiophile-grade
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  PurePlay  v1.5.31                                       │
+│  PurePlay  v1.7.0                                        │
 ├──────────────────────────────────────────────────────────┤
 │            ┌───────────────────────────────┐             │
 │            │                               │             │
@@ -81,7 +81,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 | `ALACDecoderFactory` | CoreAudio              | dedicated `.alac/.m4a/.mp4` priority 95                |
 | `CoreAudioDecoder`   | CoreAudio fallback     | `.flac/.mp3/.aac/.caf/.ogg`                            |
 | `LibFLACDecoder`     | libFLAC (xcframework)  | activates when `CFLAC` is available, priority 100      |
-| `FFmpegDecoder`      | FFmpeg (shipped dylib) | universal fallback: APE, WMA, Opus, Vorbis, WavPack, TTA, Matroska via custom AVIO |
+| `FFmpegDecoder`      | FFmpeg (shipped dylib) | universal fallback: APE, DTS, WMA, Opus, Vorbis, WavPack, TTA, Matroska via custom AVIO; auto-detects container format |
 | `CueSheet` parser    | self-implemented       | one-FILE multi-TRACK split via `TrimmingDecoder`       |
 | FLAC MD5 verifier    | self-implemented       | parses STREAMINFO, validates the embedded MD5 hash     |
 
@@ -94,7 +94,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 
 ### Cloud (夸克网盘) — proper streaming, not buffering-then-playing
 - **Sparse-chunk cache** — `CloudStreamSource` partitions the file into 1 MB blocks; fetches on demand via HTTP `Range`, max 3 concurrent requests. Memory cost stays bounded; seeks return instantly.
-- **64 KB header probe** — `CloudHeaderProber` recognises WAV / FLAC / AIFF / AIFC / DSF / DFF / MP3 / M4A / Ogg from the first 64 KB and pre-computes `AudioFormat` so decoder selection no longer depends on file-name extensions.
+- **64 KB header probe** — `CloudHeaderProber` recognises WAV / FLAC / AIFF / AIFC / DSF / DFF / MP3 / M4A / Ogg / DTS from the first 64 KB and pre-computes `AudioFormat` so decoder selection no longer depends on file-name extensions.
 - **Prefetch manager** — `CloudPrefetchManager` watches the play position and prefetches the next cloud track once the current one has ≤30 s remaining. De-duplicates per fid.
 - **Cookie-based auth** with WKWebView panel + Keychain persistence (`com.pureplay.quark.cookie`).
 - **Auto re-login** — `QuarkAPIClient` detects expired sessions (HTTP 401/403, business codes 32003/41001/41015, Chinese/English "登录失效" patterns) and fires `onAuthExpired`; the app surfaces a re-login dialog automatically.
@@ -143,7 +143,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 
 ### Install pre-built DMG
 ```sh
-open dist/PurePlay-1.5.31-Installer.dmg
+open dist/PurePlay-1.7.0-Installer.dmg
 
 # Ad-hoc-signed builds need quarantine cleared on first launch:
 xattr -dr com.apple.quarantine /Applications/PurePlay.app
@@ -368,14 +368,15 @@ swift run PurePlay
 
 ### Release + version bump + DMG
 ```sh
-./scripts/build_release.sh                    # patch +1 (default)
+./scripts/build_release.sh                    # keep current version (default)
+VERSION_PART=patch ./scripts/build_release.sh # patch +1
 VERSION_PART=minor ./scripts/build_release.sh # minor +1, patch=0
 VERSION_PART=major ./scripts/build_release.sh # major +1, minor=patch=0
 ./scripts/build_release.sh 2.0.0              # explicit version
 ```
 
 Behaviour:
-1. Reads + bumps `VERSION`.
+1. Reads `VERSION`; bumps only when `VERSION_PART` is set or an explicit version is passed.
 2. `swift build -c release --product PurePlay`.
 3. Updates `CFBundleShortVersionString` / `CFBundleVersion` in the bundle.
 4. **Codesign** — if a `Developer ID Application` identity is in the login keychain (or `DEVELOPER_ID_APP` env is set), uses hardened runtime + secure timestamp + `Resources/PurePlay.entitlements`; otherwise falls back to ad-hoc.
@@ -552,8 +553,10 @@ localplayer/
 │
 ├── Resources/
 │   ├── AppIcon.png
-│   ├── EQPresets.json          # built-in EQ presets
-│   └── KnownDSDDevices.json    # 40-DAC DSD whitelist
+│   ├── AppIcon.icns             # generated from PNG (all iconset sizes)
+│   ├── Info.plist.template      # app bundle Info.plist with UTI declarations
+│   ├── EQPresets.json           # built-in EQ presets
+│   └── KnownDSDDevices.json     # 40-DAC DSD whitelist
 │
 ├── scripts/
 │   ├── build_release.sh        # version bump + sign + DMG + dSYM
@@ -591,6 +594,7 @@ localplayer/
 | G     | ✅      | EQPanel + Cookie auto re-login + NowPlayingViewModel        |
 | S1-S3 | ✅      | 18 bug fixes: volume, stop race, chunk eviction, retry backoff, thread safety, EQ persistence, stress tests (210 total) |
 | M6    | ✅      | FFmpeg dylib + custom AVIO (APE / Opus / Vorbis / WavPack / TTA / WMA / Matroska) |
+| v1.7  | ✅      | DTS (DCA) playback via FFmpeg, local + cloud file picker DTS support, LocalizedError, Info.plist UTI declarations, version-stable builds |
 | Next  | ⏳      | taglib integration replacing AVAsset metadata reader        |
 | Next  | ⏳      | TechBadgeView (generic sample-rate / bit-depth / format badge) |
 | Next  | ⏳      | MenuBarPopover replacing NSMenu status item                 |

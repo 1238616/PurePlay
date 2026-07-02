@@ -176,7 +176,17 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     @objc private func addFiles() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio, .folder]
+        // Use allowedFileTypes (extension-based) because macOS UTI system
+        // does not recognise all supported formats (e.g. dsf/dff/dts) as
+        // public.audio, so allowedContentTypes = [.audio] would grey them out.
+        // addURLs() filters by extension anyway.
+        panel.allowedFileTypes = [
+            "flac", "ape", "wav", "aiff", "aif",
+            "dsf", "dff",
+            "alac", "m4a", "mp4",
+            "mp3", "ogg", "opus",
+            "wv", "tta", "wma", "mka", "aac", "caf", "dts"
+        ]
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
         panel.canChooseDirectories = true

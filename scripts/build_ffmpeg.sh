@@ -53,9 +53,9 @@ COMMON_FLAGS="
     --disable-postproc
     --disable-xlib
     --disable-libxcb
-    --enable-demuxer=ape,wv,tta,ogg,opus,flac,wav,aiff,dsf,mov,mp3,aac,asf,matroska
-    --enable-decoder=ape,wavpack,tta,opus,vorbis,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be,pcm_f32le,mp3,aac,alac,wmalossless,wmapro,wmav2,wmav1,wmavoice
-    --enable-parser=flac,opus,vorbis,mpegaudio,aac
+    --enable-demuxer=ape,wv,tta,ogg,opus,flac,wav,aiff,dsf,dts,mov,mp3,aac,asf,matroska
+    --enable-decoder=ape,wavpack,tta,opus,vorbis,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_s16be,pcm_s24be,pcm_s32be,pcm_f32le,mp3,aac,alac,wmalossless,wmapro,wmav2,wmav1,wmavoice,dca
+    --enable-parser=flac,opus,vorbis,mpegaudio,aac,dts
     --enable-protocol=file
     --disable-debug
     --enable-optimizations

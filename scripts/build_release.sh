@@ -17,25 +17,31 @@ cd "$ROOT"
 VERSION_FILE="$ROOT/VERSION"
 INFO_PLIST_TEMPLATE="$ROOT/Resources/Info.plist.template"
 ENTITLEMENTS="$ROOT/Resources/PurePlay.entitlements"
-PART="${VERSION_PART:-patch}"
 
 [ -f "$VERSION_FILE" ] || echo "0.0.0" > "$VERSION_FILE"
 CURRENT="$(tr -d '[:space:]' < "$VERSION_FILE")"
 
 if [ $# -ge 1 ]; then
+    # Explicit version passed: use it
     NEW_VERSION="$1"
-else
+    echo "==> Setting version: $CURRENT -> $NEW_VERSION"
+    echo "$NEW_VERSION" > "$VERSION_FILE"
+elif [ -n "${VERSION_PART:-}" ]; then
+    # VERSION_PART=major|minor|patch explicitly requested: bump
     IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT"
-    case "$PART" in
+    case "$VERSION_PART" in
         major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
         minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-        patch|*) PATCH=$((PATCH + 1)) ;;
+        patch) PATCH=$((PATCH + 1)) ;;
     esac
     NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+    echo "==> Bumping version: $CURRENT -> $NEW_VERSION (part=$VERSION_PART)"
+    echo "$NEW_VERSION" > "$VERSION_FILE"
+else
+    # Default: keep current version (no auto-bump)
+    NEW_VERSION="$CURRENT"
+    echo "==> Using version: $NEW_VERSION (set VERSION_PART=major|minor|patch to bump)"
 fi
-
-echo "==> Bumping version: $CURRENT -> $NEW_VERSION (part=$PART)"
-echo "$NEW_VERSION" > "$VERSION_FILE"
 
 # -----------------------------------------------------------------
 # Ensure FFmpeg is built
@@ -101,6 +107,15 @@ PLIST="$APP_BUILT/Contents/Info.plist"
 echo "==> Updating Info.plist version -> $NEW_VERSION"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $NEW_VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_VERSION" "$PLIST"
+
+# Sync project Resources/ into app bundle (icons, presets, etc.)
+if [ -d "$ROOT/Resources" ]; then
+    echo "==> Syncing Resources into app bundle"
+    mkdir -p "$APP_BUILT/Contents/Resources"
+    for res in "$ROOT/Resources"/*; do
+        [ -e "$res" ] && cp -R "$res" "$APP_BUILT/Contents/Resources/"
+    done
+fi
 
 echo "==> Refreshing executable inside bundle"
 cp "$BIN" "$APP_BUILT/Contents/MacOS/PurePlay"

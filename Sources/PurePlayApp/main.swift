@@ -905,7 +905,7 @@ final class VoxContentView: NSView {
             "dsf", "dff",
             "alac", "m4a", "mp4",
             "mp3", "ogg", "opus",
-            "wv", "tta", "wma", "mka", "aac", "caf"
+            "wv", "tta", "wma", "mka", "aac", "caf", "dts"
         ]
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true

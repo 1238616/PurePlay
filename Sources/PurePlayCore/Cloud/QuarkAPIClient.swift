@@ -18,7 +18,7 @@ public struct QuarkFile: Identifiable, Sendable, Codable {
     public var isAudioFile: Bool {
         guard isFile else { return false }
         let exts: Set<String> = ["flac","ape","wav","aiff","aif","dsf","dff",
-                                  "alac","m4a","mp3","ogg","opus","wv","mpc","tta","mp4","aac","caf"]
+                                  "alac","m4a","mp3","ogg","opus","wv","mpc","tta","mp4","aac","caf","dts"]
         return exts.contains(fileExtension)
     }
 

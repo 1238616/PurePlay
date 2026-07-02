@@ -30,18 +30,16 @@ public final class FFmpegDecoder: AudioDecoder {
         self.packet = av_packet_alloc()
         self.frame = av_frame_alloc()
 
-        var inputFormat: UnsafePointer<AVInputFormat>? = nil
-        if !fileExtension.isEmpty {
-            inputFormat = av_find_input_format(fileExtension)
-        }
-
+        // Let FFmpeg auto-detect format from file content (magic bytes).
+        // Forcing by extension (e.g. "dts" → raw DTS demuxer) fails for
+        // files that use a different container (e.g. DTS inside WAV).
         var fmtCtxOpt: UnsafeMutablePointer<AVFormatContext>?
 
         if let localSource = source as? LocalFileSource {
             // Local files: use FFmpeg native file I/O (avoids AVIO overhead/issues)
             fmtCtxOpt = nil
             let path = localSource.url.path
-            let openResult = avformat_open_input(&fmtCtxOpt, path, inputFormat, nil)
+            let openResult = avformat_open_input(&fmtCtxOpt, path, nil, nil)
             guard openResult == 0 else {
                 throw PurePlayError.decodeFailed("FFmpeg: avformat_open_input failed (\(openResult))")
             }
@@ -57,7 +55,7 @@ public final class FFmpegDecoder: AudioDecoder {
             fmtCtx!.pointee.pb = adapter.avioContext
 
             fmtCtxOpt = fmtCtx
-            let openResult = avformat_open_input(&fmtCtxOpt, nil, inputFormat, nil)
+            let openResult = avformat_open_input(&fmtCtxOpt, nil, nil, nil)
             guard openResult == 0 else {
                 throw PurePlayError.decodeFailed("FFmpeg: avformat_open_input failed (\(openResult))")
             }
@@ -65,11 +63,29 @@ public final class FFmpegDecoder: AudioDecoder {
 
         self.formatCtx = fmtCtxOpt
 
+        // Give FFmpeg more time to analyse raw bitstreams (e.g. DTS)
+        // where codec params like channel count may not be immediately known.
+        formatCtx!.pointee.probesize = 10_000_000        // 10 MB (default 5 MB)
+        formatCtx!.pointee.max_analyze_duration = 10_000_000  // 10 s
+
         guard avformat_find_stream_info(formatCtx, nil) >= 0 else {
             throw PurePlayError.decodeFailed("FFmpeg: avformat_find_stream_info failed")
         }
 
-        let streamIdx = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
+        // av_find_best_stream can fail for formats where channels=0
+        // (e.g. raw DTS: "unspecified number of channels"). Fall back to
+        // picking the first audio-type stream manually.
+        var streamIdx = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
+        if streamIdx < 0 {
+            let n = Int(formatCtx!.pointee.nb_streams)
+            for i in 0..<n {
+                let s = formatCtx!.pointee.streams[i]!
+                if s.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                    streamIdx = Int32(i)
+                    break
+                }
+            }
+        }
         guard streamIdx >= 0 else {
             throw PurePlayError.decodeFailed("FFmpeg: no audio stream found")
         }
