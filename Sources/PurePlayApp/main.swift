@@ -262,6 +262,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let w = mini.window, w.isVisible {
             mini.hide()
         } else {
+            mini.onPlayTrack = { [weak self] index in
+                self?.contentView.playTrackAtIndexFromCallback(index)
+            }
             mini.show(controller: playerController)
         }
     }
@@ -931,27 +934,17 @@ final class VoxContentView: NSView {
     }
 
     @objc private func prevTrack() {
-        do {
-            try playerController.previous()
-            if let idx = playerController.queue.indices.contains(playerController.currentTrackIndex) ? playerController.currentTrackIndex : nil {
-                playTrackAtIndex(idx)
-            }
-        } catch {
-            titleLabel.stringValue = "Error"
-            artistLabel.stringValue = error.localizedDescription
-        }
+        guard let idx = playerController.previousTrackIndex() else { return }
+        playTrackAtIndex(idx)
     }
 
     @objc private func nextTrack() {
-        do {
-            try playerController.next()
-            if let idx = playerController.queue.indices.contains(playerController.currentTrackIndex) ? playerController.currentTrackIndex : nil {
-                playTrackAtIndex(idx)
-            }
-        } catch {
-            titleLabel.stringValue = "Error"
-            artistLabel.stringValue = error.localizedDescription
+        guard let idx = playerController.nextTrackIndex() else {
+            playerController.stop()
+            updatePlayButtonIcon()
+            return
         }
+        playTrackAtIndex(idx)
     }
 
     private func updatePlayButtonIcon() {

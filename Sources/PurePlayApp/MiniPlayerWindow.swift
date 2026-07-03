@@ -20,6 +20,9 @@ final class MiniPlayerWindow: NSWindowController {
     private var playButton: NSButton!
     private var refreshTimer: Timer?
 
+    /// 由 AppDelegate 注入：根据索引播放曲目（自动区分本地/云盘）
+    var onPlayTrack: ((Int) -> Void)?
+
     private init() {
         let rect = NSRect(x: 0, y: 0, width: 320, height: 120)
         let window = NSWindow(
@@ -184,10 +187,16 @@ final class MiniPlayerWindow: NSWindowController {
     // MARK: - Actions
 
     @objc private func prevAction() {
-        try? playerController?.previous()
+        guard let pc = playerController, let idx = pc.previousTrackIndex() else { return }
+        onPlayTrack?(idx)
     }
     @objc private func nextAction() {
-        try? playerController?.next()
+        guard let pc = playerController else { return }
+        guard let idx = pc.nextTrackIndex() else {
+            pc.stop()
+            return
+        }
+        onPlayTrack?(idx)
     }
     @objc private func playPauseAction() {
         guard let pc = playerController else { return }

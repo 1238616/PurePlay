@@ -337,13 +337,20 @@ public final class PlayerController: @unchecked Sendable {
     }
 
     public func previous() throws {
-        guard currentTrackIndex > 0 else {
-            if playMode == .loopAll && !queue.isEmpty {
-                try playFromQueue(index: queue.count - 1)
-            }
-            return
+        guard let idx = previousTrackIndex() else { return }
+        try playFromQueue(index: idx)
+    }
+
+    /// 根据播放模式计算上一曲索引（与 nextTrackIndex 对称，不触发播放）
+    public func previousTrackIndex() -> Int? {
+        guard !queue.isEmpty else { return nil }
+        if currentTrackIndex > 0 {
+            return currentTrackIndex - 1
         }
-        try playFromQueue(index: currentTrackIndex - 1)
+        if playMode == .loopAll {
+            return queue.count - 1
+        }
+        return nil
     }
 
     /// 根据播放模式计算下一曲索引

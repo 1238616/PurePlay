@@ -8,7 +8,7 @@ A SwiftPM package combining a Vox-inspired minimal dark UI with audiophile-grade
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  PurePlay  v1.7.0                                        │
+│  PurePlay  v1.7.1                                        │
 ├──────────────────────────────────────────────────────────┤
 │            ┌───────────────────────────────┐             │
 │            │                               │             │
@@ -143,7 +143,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 
 ### Install pre-built DMG
 ```sh
-open dist/PurePlay-1.7.0-Installer.dmg
+open dist/PurePlay-1.7.1-Installer.dmg
 
 # Ad-hoc-signed builds need quarantine cleared on first launch:
 xattr -dr com.apple.quarantine /Applications/PurePlay.app
@@ -595,6 +595,7 @@ localplayer/
 | S1-S3 | ✅      | 18 bug fixes: volume, stop race, chunk eviction, retry backoff, thread safety, EQ persistence, stress tests (210 total) |
 | M6    | ✅      | FFmpeg dylib + custom AVIO (APE / Opus / Vorbis / WavPack / TTA / WMA / Matroska) |
 | v1.7  | ✅      | DTS (DCA) playback via FFmpeg, local + cloud file picker DTS support, LocalizedError, Info.plist UTI declarations, version-stable builds |
+| v1.7.1| ✅      | Fix cloud track next/previous switching error (I/O error: Cloud tracks require async playback) in main window + mini player |
 | Next  | ⏳      | taglib integration replacing AVAsset metadata reader        |
 | Next  | ⏳      | TechBadgeView (generic sample-rate / bit-depth / format badge) |
 | Next  | ⏳      | MenuBarPopover replacing NSMenu status item                 |
