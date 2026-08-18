@@ -62,35 +62,36 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 - **Hog Mode + PhysicalFormat + mixable=0** — `CoreAudioHALOutput` takes exclusive control of the chosen DAC, writes the precise sample-rate and bit-depth via `kAudioStreamPropertyPhysicalFormat`, and restores the original `SupportsMixing` flag on release.
 - **Four-class CoreAudio listener** (`AudioDeviceListener`) — wires `DeviceIsAlive`, `DefaultOutputDevice`, `PhysicalFormat`, and `Devices` events back to the controller; unplug triggers an immediate pause + UI refresh.
 - **Per-track sample-rate switching** (`SampleRateManager`) with `switchAndWait` polling.
-- **Bit-perfect by default** — `DSPChain.build` returns an empty chain unless the user explicitly opts into EQ / crossfeed / dither / ReplayGain.
+- **Bit-perfect by default** — `DSPChain.build` returns an empty chain unless the user explicitly opts into EQ / crossfeed / dither / ReplayGain. DSD sources always force an empty chain: any DSP would corrupt the DoP marker bytes, so the pipeline silently stays bit-perfect and the UI reports "EQ bypassed for DSD".
 - **Integer PCM straight-through** — 16/24/32-bit signed packed ASBD when the source is integer; only float when DSP is engaged.
 - **DSD via DoP v1.1** — `DSF` (LSB-first) and `DFF` (MSB-first) decoders both feed `DoPPacker` to emit byte-swapped 24-bit DoP markers that survive any little-endian CoreAudio path.
 - **Gesemann 96-tap DSD→PCM** — `DSD2PCMConverter` with 256-entry lookup × 12-byte window for high-quality fallback when DoP is unavailable.
 - **Kaiser-Sinc resampler** — `SincResampler` ships a 32-zero-crossing × 64-phase polyphase table with Kaiser β=9 (~-95 dB stopband); honest Swift code, no external dependency. `LibSoXR` slot ready when the user opts into the binary framework.
 - **Lock-free ring buffer** — `PCMRingBuffer` single-producer/single-consumer with `swift-atomics`; 2-second default capacity.
 - **Gapless playback** — `AudioPipeline.swapDecoder(_:)` exchanges decoders mid-flight when formats match; `PlayerController.tryGaplessAdvance()` automatically wires this for the queue.
-- **DAC capability probe** — `DACCapabilityProbe` cross-references `AvailableNominalSampleRates` with the bundled 40-DAC whitelist (`Resources/KnownDSDDevices.json`).
+- **DAC capability probe** — `DACCapabilityProbe` cross-references `AvailableNominalSampleRates` with the bundled 41-DAC whitelist (`Resources/KnownDSDDevices.json`).
 
 ### Decoders (8 formats + FFmpeg universal fallback)
 | Decoder              | Library                | Notes                                                  |
 | -------------------- | ---------------------- | ------------------------------------------------------ |
 | `WAVDecoder`         | self-implemented       | PCM 16/24/32 + IEEE float; RF64 large-file support     |
 | `AIFFDecoder`        | self-implemented       | AIFF/AIFC, big-endian → little-endian swap, IEEE-80 SR |
-| `DSFDecoder`         | self-implemented       | DSD64..DSD256, LSB-first → DoP                         |
-| `DFFDecoder`         | self-implemented       | DSDIFF (FRM8), MSB-first → DoP                         |
+| `DSFDecoder`         | self-implemented       | DSD64..DSD1024, strict 5-rate allowlist, LSB-first → DoP |
+| `DFFDecoder`         | self-implemented       | DSDIFF (FRM8), DSD64..DSD1024, MSB-first → DoP         |
 | `ALACDecoderFactory` | CoreAudio              | dedicated `.alac/.m4a/.mp4` priority 95                |
 | `CoreAudioDecoder`   | CoreAudio fallback     | `.flac/.mp3/.aac/.caf/.ogg`                            |
 | `LibFLACDecoder`     | libFLAC (xcframework)  | activates when `CFLAC` is available, priority 100      |
-| `FFmpegDecoder`      | FFmpeg (shipped dylib) | universal fallback: APE, DTS, WMA, Opus, Vorbis, WavPack, TTA, Matroska via custom AVIO; auto-detects container format |
+| `FFmpegDecoder`      | FFmpeg (shipped dylib) | universal fallback (priority 80): APE, DTS (DCA), WMA incl. Lossless/Pro, Opus, Vorbis, WavPack, TTA, `.mka`/Matroska via custom AVIO; auto-detects container format (handles DTS-in-WAV) |
+| `SineDecoder`        | self-implemented       | synthetic sine source for file-less E2E verification (`.sine`) |
 | `CueSheet` parser    | self-implemented       | one-FILE multi-TRACK split via `TrimmingDecoder`       |
 | FLAC MD5 verifier    | self-implemented       | parses STREAMINFO, validates the embedded MD5 hash     |
 
 ### DSP nodes (all bypassable)
-- **BiquadEQNode** — 10-band graphic EQ (31 Hz … 16 kHz), bandwidth Q = 1.414
+- **ParametricEQNode** — the centrepiece (see [ADR-0002](docs/adr/0002-parametric-eq-replaces-graphic-eq.md)): up to 20 bands, each with type (Peak / Low Shelf / High Shelf / Low-Pass 12 dB / High-Pass 12 dB), frequency 20 Hz–20 kHz, gain ±24 dB, Q 0.1–30, plus a chain pre-amp. Block-level coefficient interpolation (~93 ms) makes live parameter changes click-free; bands hot-update from the UI thread without re-building the chain.
 - **CrossfeedNode** — BS2B-style 700 Hz IIR LP + opposite-channel injection
 - **GainNode** — pre-amp / ReplayGain in dB
 - **DitherNode** — TPDF dither for bit-depth reduction
-- **SincResampler** — variable-ratio multi-phase Sinc (replaces the placeholder linear resampler)
+- **LinearResamplerNode** — the chain's current resampler slot; a Kaiser-windowed **SincResampler** (32 zero-crossings × 64 phases) is implemented and unit-tested, ready to be wired in
 
 ### Cloud (夸克网盘) — proper streaming, not buffering-then-playing
 - **Sparse-chunk cache** — `CloudStreamSource` partitions the file into 1 MB blocks; fetches on demand via HTTP `Range`, max 3 concurrent requests. Memory cost stays bounded; seeks return instantly.
@@ -113,10 +114,13 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 ### UI (AppKit)
 - **`SignalPathBar`** — driven by the structured `SignalPath` Core type; status dot + middle-truncated text label. Always reflects DSP bypass + hardware rate matching + Hog state.
 - **`WaveformView`** — Core Graphics scrolling waveform fed by `WaveformBuffer` (peak + RMS bins). Green/amber/red colour temperature based on peak headroom.
-- **`SpectrumView`** — CVDisplayLink-driven 48-band vDSP FFT visualizer.
-- **`EQCurveEditor`** + **`EQPanel`** — draggable 10-band graphic EQ with Catmull-Rom smoothed curve, hover tooltip, double-click to reset, JSON-loaded presets from `Resources/EQPresets.json`.
+- **`SpectrumView`** — CVDisplayLink-driven 48-band vDSP FFT visualizer. The analyzer is sample-rate aware (correct bin→Hz mapping at 44.1–384 kHz) and uses asymmetric attack/release smoothing (50 ms / 300 ms) so beats snap up instantly and decay naturally.
+- **`EQPanel`** (780×520, min 700×520) — professional parametric EQ window laid out per [ADR-0003](docs/adr/0003-eq-panel-layout.md): toolbar row (title, on/off switch, preset menu, Import / Save / Reset, current-headphone chip floated right), a `ParametricEQEditor` curve that absorbs all remaining height, and a fixed 180 pt band region (pre-amp slider row + `EQBandTableView`).
+- **`ParametricEQEditor`** — draggable band nodes on the frequency-response curve: drag = frequency + gain, scroll wheel over a node = Q, double-click a node = reset its gain, double-click empty space = add a band (max 20).
+- **`EQBandTableView`** — exact-value band table (Type / Freq / Q / Gain / Enable) with per-row filter-type popup, pre-amp slider, and +/− band buttons.
+- **AutoEQ import** — `AutoEQParser` reads AutoEQ ParametricEQ text files via the Import button, applies pre-amp + bands, and extracts the headphone model from the file name for the toolbar chip (5000+ correction profiles work out of the box).
 - **`MiniPlayerWindow`** — floating 320×120 always-on-top mini player (⇧⌘M).
-- **`DSDBadgeView`** — golden serif-italic `DSD64/128/256/512` badge.
+- **`DSDBadgeView`** — golden serif-italic `DSD64/128/256/512/1024` badge.
 - **`NowPlayingViewModel`** — immutable value type, derived from `PlayerController`; the single-point `applyNowPlaying(_:)` update API on `VoxContentView` makes future SwiftUI migration painless.
 - **`AlbumGridView` / `LibraryBrowser` / `QueueView` / `SmartPlaylistEditor` / `SearchBar`** — Vox-inspired dark theme throughout.
 
@@ -143,7 +147,7 @@ The colored dot in the bottom signal-path bar reports the true playback state:
 
 ### Install pre-built DMG
 ```sh
-open dist/PurePlay-1.7.1-Installer.dmg
+open dist/PurePlay-<version>-Installer.dmg
 
 # Ad-hoc-signed builds need quarantine cleared on first launch:
 xattr -dr com.apple.quarantine /Applications/PurePlay.app
@@ -160,7 +164,8 @@ open .build/release/PurePlay.app
 ### Run tests
 ```sh
 swift run PurePlayTests
-# Tests: 210 total, 210 passed, 0 failed
+# Tests: 272 total, 272 passed, 0 failed
+# (275 when built with the vendored FFmpeg module flags)
 ```
 
 ---
@@ -174,7 +179,7 @@ PurePlay is a two-target SwiftPM package — pure-Swift Core, AppKit-only App.
 │                       PurePlayApp (executable)                    │
 │  AppDelegate · VoxContentView · NowPlayingViewModel               │
 │  SignalPathBar · WaveformView · SpectrumView · DSDBadgeView       │
-│  EQCurveEditor · EQPanel · MiniPlayerWindow · LibraryBrowser      │
+│  ParametricEQEditor · EQBandTableView · EQPanel · LibraryBrowser  │
 │  AlbumGridView · QueueView · SmartPlaylistEditor · SearchBar      │
 │  GlobalHotKey · MediaKeyHandler · QuarkLoginPanel · FileBrowser   │
 └──────────────────────────────┬────────────────────────────────────┘
@@ -192,18 +197,19 @@ PurePlay is a two-target SwiftPM package — pure-Swift Core, AppKit-only App.
 │               ▼                              ▼                    │
 │  ┌─Decoder ──────────────┐  ┌─DSP ──────────┐  ┌─Buffer ──────┐   │
 │  │ DecoderRegistry        │  │ DSPChain      │  │ PCMRingBuffer│   │
-│  │ WAV / AIFF / DSF / DFF │  │ BiquadEQ      │  │ (lock-free)  │   │
+│  │ WAV / AIFF / DSF / DFF │  │ ParametricEQ  │  │ (lock-free)  │   │
 │  │ ALAC / CoreAudio       │  │ Crossfeed     │  └──────────────┘   │
 │  │ CueSheet + Trimming    │  │ Dither / Gain │                     │
-│  │ LibFLAC (when CFLAC)   │  │ SincResampler │                     │
+│  │ LibFLAC (when CFLAC)   │  │ Resampler     │                     │
 │  │ FLACMetadata + MD5     │  └───────────────┘                     │
+│  │ Sine (test)            │                                       │
 │  └────────┬───────────────┘                                       │
 │           ▼                                                       │
 │  ┌─DSD ──────────────────┐  ┌─Output ─────────────────────┐       │
 │  │ DoPPacker             │  │ CoreAudioHALOutput          │       │
 │  │ DSD2PCMConverter      │  │ AudioDeviceListener         │       │
 │  │ DACCapabilityProbe    │  │ SampleRateManager           │       │
-│  │ KnownDSDDevices(40)   │  └─────────────────────────────┘       │
+│  │ KnownDSDDevices(41)   │  └─────────────────────────────┘       │
 │  └───────────────────────┘                                        │
 │                                                                   │
 │  ┌─Source ────────────┐  ┌─Library ─────────────┐                 │
@@ -245,7 +251,7 @@ When the source is FLAC 24/96 and the DAC accepts 96 kHz: the decoded `int32` bl
 Decoder → int→float → ReplayGain → Resampler → EQ → Crossfeed → Dither → ring buffer
 ```
 
-DSPChain.build assembles only the enabled nodes; everything is skipped in bit-perfect mode.
+DSPChain.build assembles only the enabled nodes; everything is skipped in bit-perfect mode. DSD sources override the preferences and always take the bypassed path, because DSP would corrupt DoP marker bytes.
 
 ### Gapless
 
@@ -276,6 +282,10 @@ DSF / DFF  ──▶  DoPPacker  ──▶  24-bit DoP frame  ──▶  byte-sw
 
 For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesemann path that decimates the DSD bitstream to PCM at `dsd_rate / 8`.
 
+### DSD1024
+
+`DSDRate` covers the full ladder DSD64 / 128 / 256 / 512 / 1024 with a strict five-rate allowlist in the DSF/DFF parsers. `DSDStrategyChooser` decides DoP vs. PCM per (rate, DAC capability, user preference); because no DAC accepts a 45.1584 MHz PCM stream, `DACCapabilityProbe` always reports DSD1024 as DoP-incapable, so DSD1024 resolves to PCM output at the user's `dsdMaxPCMRate` preference (384 kHz default, 768 kHz opt-in), decimated through the `DSD2PCMConverter` FIR path. Lower DSD rates keep the DoP path on capable DACs.
+
 ---
 
 ## Module Reference
@@ -300,17 +310,18 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `Decoder/CoreAudioDecoder.swift`    | ExtAudioFile path                                      |
 | `Decoder/LibFLACDecoder.swift`      | libFLAC binding (`#if canImport(CFLAC)`)               |
 | `Decoder/FLACMetadata.swift`        | STREAMINFO + Vorbis Comments + MD5 verifier            |
+| `Decoder/SineDecoder.swift`         | Synthetic sine decoder for file-less E2E tests         |
 | `Decoder/FFmpegDecoder.swift`       | FFmpeg universal decoder (shipped dylibs)              |
 | `Decoder/FFmpegAVIOAdapter.swift`   | Custom AVIO context bridging Swift I/O to FFmpeg       |
 | `Decoder/FFmpegSampleFormatSelector.swift` | Optimal sample format negotiation for FFmpeg   |
 | `DSD/DoPPacker.swift`               | DSD-over-PCM marker injection                          |
 | `DSD/DSD2PCMConverter.swift`        | Gesemann 96-tap FIR                                    |
 | `DSD/DACCapabilityProbe.swift`      | Per-device DSD support detection                       |
-| `DSP/DSPChain.swift`                | Auto-assembled node chain                              |
-| `DSP/DSPNodes.swift`                | Gain / BiquadEQ / Crossfeed / Dither                   |
+| `DSP/DSPChain.swift`                | Auto-assembled node chain + `DSPPreferences`           |
+| `DSP/DSPNodes.swift`                | ParametricEQ / Gain / Crossfeed / Dither / LinearResampler + `ParametricBand` model |
 | `DSP/SincResampler.swift`           | Kaiser-windowed Sinc resampler                         |
-| `DSP/EQPresetManager.swift`         | JSON-loaded EQ preset management                       |
-| `DSP/AutoEQParser.swift`            | AutoEQ headphone correction parser                     |
+| `DSP/EQPresetManager.swift`         | Factory JSON presets + user presets in `~/Library/Application Support/PurePlay/EQPresets/` |
+| `DSP/AutoEQParser.swift`            | AutoEQ ParametricEQ text import + headphone-name extraction |
 | `Output/AudioOutput.swift`          | `CoreAudioHALOutput` + protocol                        |
 | `Output/AudioDeviceListener.swift`  | 4-class CoreAudio listener                             |
 | `Output/SampleRateManager.swift`    | Switch + poll-confirm                                  |
@@ -318,6 +329,7 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `Player/QueueManager.swift`         | Queue persistence                                      |
 | `Player/SignalPath.swift`           | Structured signal-chain description                    |
 | `Library/...`                       | FSEvents watcher + scanner + smart playlist engine     |
+| `Library/LibraryModel.swift`        | `TrackInfo` + in-memory library model                  |
 | `Database/Schema.swift`             | GRDB records (extended for source/cloud/format/RG)     |
 | `Database/DatabaseManager.swift`    | Migrations v1/v2/v3 + FTS5 search                      |
 | `Metadata/MetadataReader.swift`     | AVAsset tag extraction                                 |
@@ -330,6 +342,8 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `Cloud/CloudDownloadCache.swift`    | LRU disk cache                                         |
 | `Cloud/KeychainStore.swift`         | Cookie persistence                                     |
 | `Cloud/RateLimiter.swift`           | Token-bucket throttle (5 req/s)                        |
+| `Util/AudioPreferences.swift`       | Persisted settings: device, Hog, EQ bands + A/B slots, pre-amp, `dsdMaxPCMRate`, v1.5→v1.6 EQ migration |
+| `Util/WAVTestHelper.swift`          | WAV fixture generator for tests                        |
 
 ### `PurePlayApp`
 
@@ -340,9 +354,9 @@ For DACs that do not handle DoP, `DSD2PCMConverter` provides a 96-tap FIR Gesema
 | `SignalPathBar.swift`         | LED + text status bar                                  |
 | `WaveformView.swift`          | Scrolling waveform (Core Graphics)                     |
 | `SpectrumView.swift`          | CVDisplayLink FFT visualizer                           |
-| `EQCurveEditor.swift`         | Draggable 10-band EQ curve                             |
-| `ParametricEQEditor.swift`    | Parametric EQ band editor                              |
-| `EQPanel.swift`               | EQ settings window                                     |
+| `ParametricEQEditor.swift`    | Draggable parametric EQ curve (freq/gain drag, wheel Q, double-click add/reset) |
+| `EQBandTableView.swift`       | Exact-value band table + pre-amp row                   |
+| `EQPanel.swift`               | Parametric EQ window (toolbar / curve / band region)   |
 | `MiniPlayerWindow.swift`      | Floating compact player                                |
 | `DSDBadgeView.swift`          | Golden DSD badge                                       |
 | `GlobalHotKey.swift`          | Carbon RegisterEventHotKey wrapper                     |
@@ -376,12 +390,13 @@ VERSION_PART=major ./scripts/build_release.sh # major +1, minor=patch=0
 ```
 
 Behaviour:
-1. Reads `VERSION`; bumps only when `VERSION_PART` is set or an explicit version is passed.
-2. `swift build -c release --product PurePlay`.
-3. Updates `CFBundleShortVersionString` / `CFBundleVersion` in the bundle.
-4. **Codesign** — if a `Developer ID Application` identity is in the login keychain (or `DEVELOPER_ID_APP` env is set), uses hardened runtime + secure timestamp + `Resources/PurePlay.entitlements`; otherwise falls back to ad-hoc.
-5. **dSYM** — emits `dist/PurePlay-<version>.dSYM.zip` for crash symbolication.
-6. **DMG** — `hdiutil create` with drag-to-install layout (incl. `Applications` symlink), `UDZO zlib-level=9`. Signed too when a Developer ID is available.
+1. Reads `VERSION`; bumps only when `VERSION_PART` is set or an explicit version is passed (default keeps the current version).
+2. Auto-builds FFmpeg via `scripts/build_ffmpeg.sh` if `Frameworks/FFmpeg` is missing, then `swift build -c release --product PurePlay` with the CFFmpeg module map + dylib link flags.
+3. Assembles the `.app` bundle from `Resources/Info.plist.template`, syncs `Resources/` (icon, EQ presets, DAC whitelist) into it, and updates `CFBundleShortVersionString` / `CFBundleVersion`.
+4. **Embeds the FFmpeg dylibs** into `Contents/Frameworks/`, rewrites them to `@rpath` form and drops stray Homebrew dependencies so the bundle runs on clean machines.
+5. **Codesign** — if a `Developer ID Application` identity is in the login keychain (or `DEVELOPER_ID_APP` env is set), uses hardened runtime + secure timestamp + `Resources/PurePlay.entitlements`; otherwise falls back to ad-hoc.
+6. **dSYM** — emits `dist/PurePlay-<version>.dSYM.zip` for crash symbolication.
+7. **DMG** — `hdiutil create` with drag-to-install layout (incl. `Applications` symlink), `UDZO zlib-level=9`. Signed too when a Developer ID is available.
 
 ### Notarization (when Developer ID is set up)
 ```sh
@@ -430,17 +445,20 @@ xattr -dr com.apple.quarantine /Applications/PurePlay.app
 - DAC unplug pauses playback automatically; replug + select device to resume.
 
 ### Equalizer
-- **View → Equalizer (⌘E)** opens the EQ panel.
-- Drag any of the 10 control points vertically (±12 dB). Hover for a `freq · ±dB` tooltip.
-- Double-click a single point to reset that band; double-click empty space to reset all bands.
-- Preset dropdown loads from `Resources/EQPresets.json` (Flat / Bass Boost / Treble Boost / Vocal Forward / Classical / Jazz / Electronic / Rock / Pop / Hi-Fi Loudness).
+- **View → Equalizer (⌘E)** opens the parametric EQ panel: toolbar (on/off, preset menu, Import / Save / Reset, current-headphone chip), the response-curve editor, and the band table with a pre-amp slider.
+- **Curve editing**: drag a node to move it in frequency (X) and gain (Y, ±24 dB); scroll the wheel over a node to change Q; double-click a node to reset its gain to 0 dB; double-click empty curve space to add a new Peak band (up to 20 bands).
+- **Band table**: exact values per band — filter type (Peak / Low Shelf / High Shelf / Low Pass 12 dB / High Pass 12 dB), frequency, Q (0.1–30), gain, enable checkbox — plus +/− buttons to add and remove bands.
+- **Presets**: factory presets load from `Resources/EQPresets.json` (Flat / Bass Boost / Treble Boost / Vocal Forward / Classical / Jazz / Electronic / Rock / Pop / Hi-Fi Loudness); Save writes user presets to `~/Library/Application Support/PurePlay/EQPresets/`.
+- **AutoEQ**: Import an AutoEQ `* ParametricEQ.txt` file to apply a headphone correction profile (pre-amp + bands); the headphone model is extracted from the file name and shown in the toolbar chip.
+- Parameter changes apply live and click-free (block-level coefficient interpolation). EQ settings persist across launches (A/B slot storage with automatic migration from v1.5).
+- DSD tracks always play bit-perfect: the EQ is bypassed automatically while a DSD stream is active.
 
 ### Mini Player
 - **View → Mini Player (⇧⌘M)** opens a floating 320×120 always-on-top window.
 - Shows title + active device + progress + prev/play/next.
 
 ### Format indicators
-- **Right of song title**: golden `DSD64/128/256/512` badge for native DSD streams.
+- **Right of song title**: golden `DSD64/128/256/512/1024` badge for native DSD streams.
 - **Bottom SignalPathBar**: `🟢 FLAC 24/96 → Bit-Perfect → ES9038 Hog 96kHz/24bit ✓`
   - 🟢 = bit-perfect verified
   - 🟠 = DSP active (EQ / Crossfeed / Dither / Resample)
@@ -509,21 +527,23 @@ Now Playing info (title / artist / album / artwork / duration / elapsed) is publ
 
 ```sh
 swift run PurePlayTests
-# Tests: 210 total, 210 passed, 0 failed
+# Tests: 272 total, 272 passed, 0 failed
+# (275 when built with the vendored FFmpeg module flags: adds 3 CFFmpeg-gated registry tests)
 ```
 
 The custom harness (no XCTest dependency) covers:
 
-- **Audio core** — `AudioFormat`, `PCMRingBuffer` concurrency, `MemorySource`, `WaveformBuffer` ring + peak/rms math
-- **Decoders** — WAV (incl. RF64), AIFF (BE→LE swap, IEEE-80), DSF/DFF DoP markers + seek reset, CUE parser + `TrimmingDecoder`, FLAC MD5 verifier, ALAC factory priority, CoreAudio registry
-- **DSP** — `BiquadEQ`, `Crossfeed`, `Gain`, `DitherNode`, `SincResampler` (1:1 identity, 2:1 decimation, stereo interleave, reset), `DSD2PCMConverter` (rate math, DC-balanced input, capacity limit)
-- **DSD strategy** — DoP packing, marker alternation, `DSDStrategyChooser` decisions
+- **Audio core** — `AudioFormat`, `PCMRingBuffer` concurrency, `MemorySource`, `WaveformBuffer` ring + peak/rms math, `SpectrumAnalyzer` (single-tone band mapping at multiple sample rates, asymmetric attack/release)
+- **Decoders** — WAV (incl. RF64 + float32), AIFF (BE→LE swap, IEEE-80), DSF/DFF DoP markers + seek reset, CUE parser + `TrimmingDecoder`, FLAC MD5 verifier, ALAC factory priority, CoreAudio registry, `SineDecoder`, FFmpeg sample-format selection (3 CFFmpeg-gated registry tests when FFmpeg is linked)
+- **DSP** — `ParametricEQNode` (incl. legacy graphic-preset compatibility), `Crossfeed` full-signal, `Gain`, `DitherNode`, `SincResampler` (1:1 identity, 2:1 decimation, stereo interleave, reset), `DSD2PCMConverter` (rate math, DC-balanced input, capacity limit), DSP-chain assembly
+- **DSD strategy** — DoP packing, marker alternation, `DSDStrategyChooser` decisions incl. DSD1024 (PCM-only, 384k default / 768k opt-in), pipeline forces DSP bypass for DSD
 - **DAC probe** — whitelist match (case-insensitive substring), per-rate capability inference
 - **SignalPath** — bit-perfect detection, DSD source, display text format
 - **Gapless** — `canSwapDecoder` precondition, `swapDecoder` accepts/rejects, `tryGaplessAdvance` end-to-end
-- **Cloud** — `CloudHeaderProber` for 8 formats incl. garbage rejection, `CloudStreamSource` chunk injection / boundary crossing / seek / EOF, `CloudPrefetchManager` threshold + dedupe + consume
-- **Database & Library** — Schema v2 fields, FTS5 empty / quote injection robustness, GRDB CRUD, smart-playlist engine, scanner + file watcher
-- **Acceptance (Design § 12)** — WAV byte-perfect round-trip, DSD→DoP round-trip, Hog exclusivity, auto sample-rate switch, true bit-perfect mode, PhysicalFormat preference, device lifecycle hooks
+- **Cloud** — `CloudHeaderProber` for 8 formats incl. garbage rejection, `CloudStreamSource` chunk injection / boundary crossing / seek / EOF, `CloudPrefetchManager` threshold + dedupe + consume, timer-scheduling regression
+- **Database & Library** — Schema v2 fields, FTS5 empty / quote injection robustness, GRDB CRUD, smart-playlist engine, scanner + file watcher, metadata reader
+- **Preferences** — `dsdMaxPCMRate` default/clamp/opt-in, EQ A/B slot storage, v1.5→v1.6 EQ migration idempotency
+- **E2E & stress** — full pipeline playback loops, bit-perfect acceptance suite (WAV byte-perfect round-trip, DSD→DoP round-trip, Hog exclusivity, auto sample-rate switch, PhysicalFormat preference, device lifecycle hooks)
 
 ---
 
@@ -531,8 +551,10 @@ The custom harness (no XCTest dependency) covers:
 
 ```
 localplayer/
-├── AGENT.md               # Maintainer guide
+├── AGENT.md               # Product design document (Strawberry-inspired architecture)
+├── CONTEXT.md             # Ubiquitous-language glossary for contributors
 ├── Design.md              # Long-form product/design document
+├── FixPlan.md             # Open fix plan
 ├── Test_plan.md           # Test strategy
 ├── README.md              # this file
 ├── Package.swift          # SwiftPM manifest
@@ -554,9 +576,9 @@ localplayer/
 ├── Resources/
 │   ├── AppIcon.png
 │   ├── AppIcon.icns             # generated from PNG (all iconset sizes)
-│   ├── Info.plist.template      # app bundle Info.plist with UTI declarations
-│   ├── EQPresets.json           # built-in EQ presets
-│   └── KnownDSDDevices.json     # 40-DAC DSD whitelist
+│   ├── Info.plist.template      # app bundle Info.plist (icon + version metadata)
+│   ├── EQPresets.json           # built-in EQ presets (v2: parametric bands + legacy gains)
+│   └── KnownDSDDevices.json     # 41-DAC DSD whitelist
 │
 ├── scripts/
 │   ├── build_release.sh        # version bump + sign + DMG + dSYM
@@ -590,12 +612,15 @@ localplayer/
 | M4    | ✅      | Schema v2/v3 + FTS5 + gapless `swapDecoder` + GlobalHotKey  |
 | M5    | ✅      | Sparse cloud chunks + Range Seek + header probe + prefetch  |
 | P6    | ✅      | DMG + dSYM + Notarize script + Cask + perf bench + xcfw scripts |
-| UI    | ✅      | SignalPathBar + WaveformView + MiniPlayer + EQCurveEditor   |
+| UI    | ✅      | SignalPathBar + WaveformView + MiniPlayer + EQ panel (now parametric) |
 | G     | ✅      | EQPanel + Cookie auto re-login + NowPlayingViewModel        |
 | S1-S3 | ✅      | 18 bug fixes: volume, stop race, chunk eviction, retry backoff, thread safety, EQ persistence, stress tests (210 total) |
 | M6    | ✅      | FFmpeg dylib + custom AVIO (APE / Opus / Vorbis / WavPack / TTA / WMA / Matroska) |
-| v1.7  | ✅      | DTS (DCA) playback via FFmpeg, local + cloud file picker DTS support, LocalizedError, Info.plist UTI declarations, version-stable builds |
+| v1.6  | ✅      | Parametric EQ engine (20 bands, LP/HP, click-free coefficient interpolation) · DSD1024 + `dsdMaxPCMRate` · EQ A/B slot persistence + v1.5 migration · AutoEQ import + headphone chip · spectrum axis fix + asymmetric smoothing · WMA/MKA via FFmpeg |
+| v1.7  | ✅      | DTS (DCA) playback via FFmpeg, local + cloud file picker DTS support, LocalizedError, proper app bundle Info.plist + app icon, extension-based audio file filters, version-stable builds |
 | v1.7.1| ✅      | Fix cloud track next/previous switching error (I/O error: Cloud tracks require async playback) in main window + mini player |
+| Next  | ⏳      | EQ polish: spectrum overlay on the EQ canvas, double-click numeric entry with unit parsing, Option-drag Q, A/B slot switch UI |
+| Next  | ⏳      | Unsupported-codec grayout (tooltip + auto-skip) · FFmpeg metadata fallback for WMA/MKA tags + covers · audio-thread performance HUD |
 | Next  | ⏳      | taglib integration replacing AVAsset metadata reader        |
 | Next  | ⏳      | TechBadgeView (generic sample-rate / bit-depth / format badge) |
 | Next  | ⏳      | MenuBarPopover replacing NSMenu status item                 |

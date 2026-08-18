@@ -649,7 +649,10 @@ runTest("dsfRegistryResolves") {
     try assertTrue(decoder.format.isDSD)
 }
 
-runTest("pipelineRefusesDSDWithDSP") {
+runTest("pipelineBypassesDSPForDSD") {
+    // DSD (DoP) must stay bit-perfect — any DSP would corrupt the marker
+    // bytes. The pipeline silently forces an empty chain instead of
+    // refusing to start; the UI layer tells the user "EQ bypassed for DSD".
     let data = DSFTestHelper.makeMinimalDSF()
     let source = MemorySource(data: data)
     let decoder = try DSFDecoder(source: source)
@@ -659,7 +662,8 @@ runTest("pipelineRefusesDSDWithDSP") {
     prefs.parametricBands = [ParametricBand(type: .peaking, frequency: 1000, gain: 3, q: 1.414)]
     let output = MockAudioOutput()
     let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: prefs)
-    try assertThrows(try pipe.start())
+    try assertTrue(pipe.dspChain.isBypass, "DSD must force an empty DSP chain")
+    try assertTrue(pipe.outputFormat.isDSD, "DSD output format must be preserved")
 }
 
 // ═══════════════════════════════════════════════════════
