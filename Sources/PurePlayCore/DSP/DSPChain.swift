@@ -59,8 +59,17 @@ public final class DSPChain {
             nodes.append(CrossfeedNode(intensity: preferences.crossfeedIntensity))
         }
 
-        if preferences.ditherEnabled {
-            nodes.append(DitherNode(targetBitDepth: preferences.ditherTargetBitDepth))
+        // issue #9：dither 不再挂在 float 链中 — 量化噪声整形必须发生在
+        // **真正的量化点**（float → 整数输出转换），由 AudioPipeline 内的
+        // PCMOutputConverter 结合 ditherEnabled/ditherTargetBitDepth 执行。
+        // 旧 DitherNode 在 float 域预量化后 HAL 还会再量化一次，形同虚设；
+        // 类保留供单测与实验，但不再自动接线。
+
+        // issue #7：链末软限幅 — EQ/preamp/Gain 提升后峰值超过 ±1.0 时，
+        // 整数输出量化会产生硬削波。阈值 0.8 以下零失真直通，超过部分
+        // tanh 软膝渐近压向 1.0，永不越界。
+        if preferences.limiterEnabled {
+            nodes.append(SoftLimiterNode())
         }
 
         return DSPChain(nodes: nodes, inputFormat: inputFormat)
@@ -106,8 +115,14 @@ public struct DSPPreferences: Sendable {
     public var crossfeedEnabled: Bool = false
     public var crossfeedIntensity: Float = 0.5
 
+    /// TPDF dither — 由 PCMOutputConverter 在 float → 整数量化点施加（issue #9）
     public var ditherEnabled: Bool = false
+    /// dither/降位目标位深：≤16 → 输出 int16，否则 int24
     public var ditherTargetBitDepth: Int = 16
+
+    /// 链末软限幅（issue #7）：防止 EQ/preamp 提升后整数输出量化硬削波。
+    /// 阈值 0.8 以下完全直通，无听感代价。
+    public var limiterEnabled: Bool = true
 
     public init() {}
 }

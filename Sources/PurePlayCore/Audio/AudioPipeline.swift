@@ -20,6 +20,16 @@ public final class AudioPipeline {
     /// DSD/DoP 永不重采样（会损毁标记字节）。
     public private(set) var resampler: SincResampler?
 
+    /// float → 整数输出转换器（issue #9）：float 路径（DSP 非 bypass 或有
+    /// 重采样器）在线时非 nil。量化发生在 PurePlay 可控域内 — 按源原生
+    /// 位深输出，TPDF dither（若启用）施加在真正的量化点，而非交给
+    /// CoreAudio HAL 做不带抖动的 float→int。
+    public private(set) var outputConverter: PCMOutputConverter?
+
+    /// 生效的 DSP 偏好（DSD 已强制 bit-perfect）；start() 重采样决策后
+    /// 重建 outputConverter 时复用
+    private let dspPrefs: DSPPreferences
+
     /// Optional spectrum analyzer that taps the decoded float buffer.
     public var spectrumAnalyzer: SpectrumAnalyzer?
 
@@ -71,6 +81,7 @@ public final class AudioPipeline {
             }
             return dspPreferences
         }()
+        self.dspPrefs = effectivePrefs
 
         // DSP 链（Bit-Perfect 模式下空链）
         let chain = DSPChain.build(inputFormat: decoder.format, preferences: effectivePrefs)
@@ -88,17 +99,22 @@ public final class AudioPipeline {
         }
 
         // 输出格式 = 重采样目标率 > DSP 链输出 > 解码器原始格式
+        // issue #9：float 路径（DSP 或重采样在线）的输出格式为**整数**
+        // （源原生位深），最终量化由 PCMOutputConverter 在 PurePlay 可控
+        // 域内完成 — 不再固定 float32 交给 CoreAudio HAL 做不可控转换。
         let outFmt: AudioFormat
-        if let r = resampler {
-            outFmt = AudioFormat(sampleRate: r.outputRate,
-                                 channels: decoder.format.channels,
-                                 sampleFormat: .float32)
-        } else if chain.isBypass {
+        if chain.isBypass && resampler == nil {
             outFmt = decoder.format
         } else {
-            outFmt = AudioFormat(sampleRate: chain.outputFormat.sampleRate,
-                                 channels: chain.outputFormat.channels,
-                                 sampleFormat: .float32)
+            let outSF = Self.dspOutputSampleFormat(decoderFormat: decoder.format,
+                                                   prefs: effectivePrefs)
+            let outRate = resampler?.outputRate ?? chain.outputFormat.sampleRate
+            outFmt = AudioFormat(sampleRate: outRate,
+                                 channels: decoder.format.channels,
+                                 sampleFormat: outSF)
+            self.outputConverter = PCMOutputConverter(
+                targetFormat: outSF,
+                ditherEnabled: effectivePrefs.ditherEnabled)
         }
         self.outputFormat = outFmt
 
@@ -132,9 +148,15 @@ public final class AudioPipeline {
                     resampler = SincResampler(inputRate: decoder.format.sampleRate,
                                               outputRate: target,
                                               channels: outputFormat.channels)
+                    // issue #9：重采样输出同样走整数量化点
+                    let outSF = Self.dspOutputSampleFormat(decoderFormat: decoder.format,
+                                                           prefs: dspPrefs)
                     outputFormat = AudioFormat(sampleRate: target,
                                                channels: outputFormat.channels,
-                                               sampleFormat: .float32)
+                                               sampleFormat: outSF)
+                    outputConverter = PCMOutputConverter(
+                        targetFormat: outSF,
+                        ditherEnabled: dspPrefs.ditherEnabled)
                 }
                 didMatchHardwareRate = false
             } else {
@@ -255,11 +277,17 @@ public final class AudioPipeline {
         let resampleBuffer = hasResampler
             ? UnsafeMutablePointer<Float>.allocate(capacity: resampleCapacityFrames * channels)
             : nil
+        // issue #9：float → 整数输出转换缓冲（按最坏输出帧数 × 整数 BPF）
+        let maxOutFrames = hasResampler ? resampleCapacityFrames : chunkFrames
+        let convertBuffer = outputConverter != nil
+            ? UnsafeMutableRawPointer.allocate(byteCount: maxOutFrames * outputBPF, alignment: 16)
+            : nil
         defer {
             decodeBuffer.deallocate()
             floatBuffer?.deallocate()
             analyzerBuffer?.deallocate()
             resampleBuffer?.deallocate()
+            convertBuffer?.deallocate()
         }
 
         while isRunning && !Thread.current.isCancelled {
@@ -342,20 +370,55 @@ public final class AudioPipeline {
             dspChain.process(buffer: work, frameCount: frames * channels)
             applyVolume(work, sampleCount: frames * channels)
 
+            let finalFloats: UnsafeMutablePointer<Float>
+            let finalFrames: Int
             if let r = resampler, let rb = resampleBuffer {
                 // issue #5：变长重采样（-95dB Kaiser 多相 sinc）
                 let outFrames = r.process(input: work, inputFrames: frames,
                                           output: rb,
                                           outputCapacityFrames: resampleCapacityFrames)
                 guard outFrames > 0 else { continue }
-                ringBuffer.write(rb, length: outFrames * channels * 4)
-                spectrumAnalyzer?.process(samples: rb, frameCount: outFrames, channels: channels)
-                waveformBuffer?.push(samples: rb, frameCount: outFrames, channels: channels)
+                finalFloats = rb
+                finalFrames = outFrames
             } else {
-                ringBuffer.write(work, length: frames * outputBPF)
-                spectrumAnalyzer?.process(samples: work, frameCount: frames, channels: channels)
-                waveformBuffer?.push(samples: work, frameCount: frames, channels: channels)
+                finalFloats = work
+                finalFrames = frames
             }
+            // issue #9：float → 整数（源原生位深，TPDF dither 在真正量化点）
+            if let conv = outputConverter, let cb = convertBuffer {
+                conv.convert(input: finalFloats, output: cb,
+                             sampleCount: finalFrames * channels)
+                ringBuffer.write(cb, length: finalFrames * outputBPF)
+            } else {
+                // 防御回退（理论上 float 路径必有 converter）：按 float32 写
+                ringBuffer.write(finalFloats, length: finalFrames * channels * 4)
+            }
+            spectrumAnalyzer?.process(samples: finalFloats, frameCount: finalFrames, channels: channels)
+            waveformBuffer?.push(samples: finalFloats, frameCount: finalFrames, channels: channels)
+        }
+    }
+
+    /// issue #9：DSP float 域处理后的整数输出位深。
+    /// 优先级：dither 目标位深（启用时，通常伴随降位如 24→16）
+    ///        > 源原生位深（sourceBitDepth ?? 容器位深）
+    ///        > float 源默认 24-bit（PCM DAC 主流分辨率）
+    static func dspOutputSampleFormat(decoderFormat: AudioFormat,
+                                      prefs: DSPPreferences) -> SampleFormat {
+        if prefs.ditherEnabled {
+            return prefs.ditherTargetBitDepth <= 16 ? .int16 : .int24
+        }
+        let native: Int
+        if decoderFormat.sampleFormat == .float32 {
+            // float 源没有整数位深概念；带 sourceBitDepth（如 float 化封装
+            // 的 24-bit WAV）则尊重之，否则默认 24
+            native = decoderFormat.sourceBitDepth ?? 24
+        } else {
+            native = decoderFormat.sourceBitDepth ?? decoderFormat.sampleFormat.bitDepth
+        }
+        switch native {
+        case ..<17:  return .int16
+        case 17...24: return .int24
+        default:      return .int32
         }
     }
 

@@ -93,12 +93,14 @@ public final class QuarkAPIClient: @unchecked Sendable {
     private var cookies: [String: String] = [:]
     private let session: URLSession
     private let rateLimiter: RateLimiter
-    private let keychain: KeychainStore
+    /// Cookie 存储（CookieStoring 抽象 — 测试注入 InMemoryCookieStore，
+    /// 避免 SecItemCopyMatching 触发系统授权弹窗把后台测试进程挂死）
+    private let keychain: CookieStoring
 
     public private(set) var isLoggedIn: Bool = false
 
     public init(rateLimiter: RateLimiter = RateLimiter(),
-                keychain: KeychainStore = KeychainStore()) {
+                keychain: CookieStoring = KeychainStore()) {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 300

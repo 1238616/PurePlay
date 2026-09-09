@@ -636,7 +636,218 @@ runTest("chainWithDSP") {
     let fmt = AudioFormat(sampleRate: 44100, channels: 2, sampleFormat: .float32)
     let chain = DSPChain.build(inputFormat: fmt, preferences: prefs)
     try assertFalse(chain.isBypass)
-    try assertEqual(chain.nodes.count, 3)
+    // Gain + EQ + Crossfeed + SoftLimiter（issue #7：默认链末软限幅）
+    try assertEqual(chain.nodes.count, 4)
+    try assertEqual(chain.nodes.last?.name, "SoftLimiter")
+}
+
+runTest("chainLimiterCanBeDisabled") {
+    // issue #7：限幅器可关（用户显式选择原始削波行为时）
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    prefs.replayGainEnabled = true
+    prefs.limiterEnabled = false
+    let fmt = AudioFormat(sampleRate: 44100, channels: 2, sampleFormat: .float32)
+    let chain = DSPChain.build(inputFormat: fmt, preferences: prefs)
+    try assertTrue(chain.nodes.allSatisfy { $0.name != "SoftLimiter" })
+}
+
+// ═══════════════════════════════════════════════════════
+// SoftLimiter + PCMOutputConverter Tests (issue #7 / #9)
+// ═══════════════════════════════════════════════════════
+print("\n═══ SoftLimiter / PCMOutputConverter Tests ═══")
+
+runTest("softLimiterBelowThresholdPassthrough") {
+    let node = SoftLimiterNode()   // threshold 0.8
+    var samples: [Float] = [0.5, -0.79, 0.0, -0.001, 0.79]
+    let original = samples
+    samples.withUnsafeMutableBufferPointer { buf in
+        node.process(input: buf.baseAddress!, output: buf.baseAddress!, frameCount: 5)
+    }
+    for i in 0..<5 {
+        try assertEqualFloat(samples[i], original[i], accuracy: 1e-6)
+    }
+}
+
+runTest("softLimiterCompressesAboveThreshold") {
+    let node = SoftLimiterNode()
+    var samples: [Float] = [1.0, 2.0, -3.0, 100.0]
+    samples.withUnsafeMutableBufferPointer { buf in
+        node.process(input: buf.baseAddress!, output: buf.baseAddress!, frameCount: 4)
+    }
+    // f(1.0) = 0.8 + 0.2·tanh(1) ≈ 0.9523 — 软膝内明确压缩且 < 满幅
+    try assertEqualFloat(samples[0], 0.9523, accuracy: 0.001)
+    try assertLessThan(abs(samples[0]), Float(1.0))
+    // 极端输入（2.0/-3.0/100.0）：渐近满幅，永不越过（tanh ≤ 1 → y ≤ 1.0；
+    // Float 精度下 tanh(≫1) == 1.0，允许恰好贴到满幅）
+    for i in 1..<4 {
+        try assertLessThan(abs(samples[i]), Float(1.0) + 1e-6)
+        try assertGreaterThan(abs(samples[i]), Float(0.999))
+    }
+    // 单调：更大输入 → 更大输出
+    try assertGreaterThan(samples[1], samples[0])
+    // 负输入 → 负输出（奇对称）
+    try assertLessThan(samples[2], Float(0))
+}
+
+runTest("pcmConverterInt16RoundTripAndClamp") {
+    let conv = PCMOutputConverter(targetFormat: .int16, ditherEnabled: false)
+    let input: [Float] = [0.5, -0.5, 1.0, -1.0, 2.0, 0.0]
+    var outBytes = [UInt8](repeating: 0, count: input.count * 2)
+    input.withUnsafeBufferPointer { ib in
+        outBytes.withUnsafeMutableBytes { ob in
+            conv.convert(input: ib.baseAddress!, output: ob.baseAddress!, sampleCount: input.count)
+        }
+    }
+    func code16(_ i: Int) -> Int16 {
+        let lo = UInt16(outBytes[i * 2])
+        let hi = UInt16(outBytes[i * 2 + 1]) << 8
+        return Int16(bitPattern: lo | hi)
+    }
+    try assertEqual(code16(0), Int16(16384))     // 0.5 × 2^15
+    try assertEqual(code16(1), Int16(-16384))
+    try assertEqual(code16(2), Int16(32767))     // +1.0 → clamp 到 maxCode
+    try assertEqual(code16(3), Int16(-32768))    // -1.0 → minCode 合法
+    try assertEqual(code16(4), Int16(32767))     // 2.0 超幅 → clamp 不越界
+    try assertEqual(code16(5), Int16(0))
+}
+
+runTest("pcmConverterInt24RoundTrip") {
+    let conv = PCMOutputConverter(targetFormat: .int24, ditherEnabled: false)
+    let input: [Float] = [0.5, 0.25, -1.0]
+    var outBytes = [UInt8](repeating: 0, count: input.count * 3)
+    input.withUnsafeBufferPointer { ib in
+        outBytes.withUnsafeMutableBytes { ob in
+            conv.convert(input: ib.baseAddress!, output: ob.baseAddress!, sampleCount: input.count)
+        }
+    }
+    func code(_ i: Int) -> Int32 {
+        var v = Int32(outBytes[i * 3]) | (Int32(outBytes[i * 3 + 1]) << 8) | (Int32(outBytes[i * 3 + 2]) << 16)
+        if v & 0x800000 != 0 { v |= ~0xFFFFFF }
+        return v
+    }
+    try assertEqual(code(0), Int32(4194304))    // 0.5 × 2^23
+    try assertEqual(code(1), Int32(2097152))    // 0.25 × 2^23
+    try assertEqual(code(2), Int32(-8388608))   // -1.0 → minCode
+}
+
+runTest("pcmConverterInt32RoundTrip") {
+    let conv = PCMOutputConverter(targetFormat: .int32, ditherEnabled: false)
+    let input: [Float] = [0.5, -0.25]
+    var outBytes = [UInt8](repeating: 0, count: input.count * 4)
+    input.withUnsafeBufferPointer { ib in
+        outBytes.withUnsafeMutableBytes { ob in
+            conv.convert(input: ib.baseAddress!, output: ob.baseAddress!, sampleCount: input.count)
+        }
+    }
+    func code32(_ i: Int) -> Int32 {
+        let b0 = UInt32(outBytes[i * 4])
+        let b1 = UInt32(outBytes[i * 4 + 1]) << 8
+        let b2 = UInt32(outBytes[i * 4 + 2]) << 16
+        let b3 = UInt32(outBytes[i * 4 + 3]) << 24
+        return Int32(bitPattern: b0 | b1 | b2 | b3)
+    }
+    try assertEqual(code32(0), Int32(1073741824))    // 0.5 × 2^31（Float 精度内）
+    try assertEqual(code32(1), Int32(-536870912))
+}
+
+runTest("pcmConverterDitherSpreadsCodes") {
+    // 半 LSB 的 DC 输入：无 dither → 单一码值；TPDF dither → 多个码值
+    let x: Float = 0.5 / 32768.0
+    let trials = 200
+
+    let convD = PCMOutputConverter(targetFormat: .int16, ditherEnabled: true)
+    var dithered = Set<Int16>()
+    for _ in 0..<trials {
+        var b = [UInt8](repeating: 0, count: 2)
+        withUnsafePointer(to: x) { ip in
+            b.withUnsafeMutableBytes { ob in
+                convD.convert(input: ip, output: ob.baseAddress!, sampleCount: 1)
+            }
+        }
+        dithered.insert(Int16(bitPattern: UInt16(b[0]) | UInt16(b[1]) << 8))
+    }
+    try assertGreaterThan(dithered.count, 1)   // 抖动确实落在真实量化点
+    try assertLessThan(dithered.count, 5)      // ±1 LSB 三角分布，不会散得更开
+
+    let convN = PCMOutputConverter(targetFormat: .int16, ditherEnabled: false)
+    var plain = Set<Int16>()
+    for _ in 0..<trials {
+        var b = [UInt8](repeating: 0, count: 2)
+        withUnsafePointer(to: x) { ip in
+            b.withUnsafeMutableBytes { ob in
+                convN.convert(input: ip, output: ob.baseAddress!, sampleCount: 1)
+            }
+        }
+        plain.insert(Int16(bitPattern: UInt16(b[0]) | UInt16(b[1]) << 8))
+    }
+    try assertEqual(plain.count, 1)            // 无 dither → 确定性量化
+}
+
+runTest("pipelineDitherTargetsInt16Output") {
+    // issue #9：ditherEnabled + 目标位深 ≤16 → 输出格式 int16（真正降位）
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    prefs.replayGainEnabled = true
+    prefs.ditherEnabled = true
+    prefs.ditherTargetBitDepth = 16
+    let dec = SineDecoder(durationSeconds: 0.1)
+    let pipe = AudioPipeline(decoder: dec, output: MockAudioOutput(), dspPreferences: prefs)
+    try assertEqual(pipe.outputFormat.sampleFormat, .int16)
+    try assertTrue(pipe.outputConverter?.ditherEnabled ?? false)
+
+    // 目标 24 → int24
+    var prefs24 = prefs
+    prefs24.ditherTargetBitDepth = 24
+    let pipe24 = AudioPipeline(decoder: SineDecoder(durationSeconds: 0.1),
+                               output: MockAudioOutput(), dspPreferences: prefs24)
+    try assertEqual(pipe24.outputFormat.sampleFormat, .int24)
+}
+
+runTest("pipelineEQBoostLimiterPreventsHardClip") {
+    // issue #7 集成：+6dB 提升 0.9 幅正弦 → float 峰值 ~1.80（超满幅）
+    // 限幅开：码值渐近满幅但永不钉死在 maxCode（软膝）
+    // 限幅关：硬削波，大量样本钉死在 maxCode 8388607
+    func run(limiter: Bool) -> (maxCode: Int32, pinnedCount: Int) {
+        var prefs = DSPPreferences()
+        prefs.bitPerfect = false
+        prefs.replayGainEnabled = true
+        prefs.replayGainDB = 6
+        prefs.limiterEnabled = limiter
+        let dec = SineDecoder(sampleRate: 44100, channels: 1, durationSeconds: 0.5,
+                              frequency: 1000, amplitude: 0.9)
+        let pipe = AudioPipeline(decoder: dec, output: MockAudioOutput(), dspPreferences: prefs)
+        try! pipe.start()
+        Thread.sleep(forTimeInterval: 0.25)
+        let frames = 4096
+        let bpf = pipe.outputFormat.bytesPerFrame    // int24 mono = 3
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * bpf, alignment: 16)
+        defer { buf.deallocate() }
+        _ = pipe.ringBuffer.read(into: buf, length: frames * bpf)   // 必须在 stop 前读
+        pipe.stop()
+        let raw = buf.assumingMemoryBound(to: UInt8.self)
+        var maxCode: Int32 = 0
+        var pinned = 0
+        for i in 0..<frames {
+            var v = Int32(raw[i * 3]) | (Int32(raw[i * 3 + 1]) << 8) | (Int32(raw[i * 3 + 2]) << 16)
+            if v & 0x800000 != 0 { v |= ~0xFFFFFF }
+            let a = abs(v)
+            maxCode = max(maxCode, a)
+            // 8388607 = 正满幅 maxCode；8388608 = abs(minCode) 负满幅钉死
+            if a == 8388607 || a == 8388608 { pinned += 1 }
+        }
+        return (maxCode, pinned)
+    }
+
+    let limited = run(limiter: true)
+    try assertEqual(limited.pinnedCount, 0, "软限幅后不应有任何样本钉死在满幅码")
+    try assertLessThan(limited.maxCode, Int32(8388607))
+    try assertGreaterThan(limited.maxCode, Int32(8_000_000))   // 信号仍接近满幅（不是衰减掉的）
+
+    let clipped = run(limiter: false)
+    // 限幅关闭时应出现硬削波（样本钉死满幅码；负峰钉到 minCode → abs = 2^23）
+    try assertGreaterThan(clipped.pinnedCount, 0)
+    try assertEqual(clipped.maxCode, Int32(8388608))
 }
 
 // ═══════════════════════════════════════════════════════
@@ -970,7 +1181,8 @@ runTest("pipelineSincResamplerDoublesRate") {
     let out = MockAudioOutput()
     let pipe = AudioPipeline(decoder: dec, output: out, dspPreferences: prefs)
     try assertEqual(pipe.outputFormat.sampleRate, 88200.0)
-    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+    // issue #9：重采样后同样转回整数输出（float 源 → 默认 24-bit）
+    try assertEqual(pipe.outputFormat.sampleFormat, .int24)
     try assertTrue(pipe.resampler != nil)
     try pipe.start()
     Thread.sleep(forTimeInterval: 0.3)
@@ -978,21 +1190,29 @@ runTest("pipelineSincResamplerDoublesRate") {
     // 若重采样是 1:1 直通地雷，峰数会只有 ~100（变速变调）
     // 注意：必须在 stop() 之前读 — stop 会 reset ring buffer
     let frames = 17640
-    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
-    let read = pipe.ringBuffer.read(into: buf, length: frames * 4)
+    let bpf = pipe.outputFormat.bytesPerFrame          // int24 mono = 3
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * bpf, alignment: 16)
+    let read = pipe.ringBuffer.read(into: buf, length: frames * bpf)
     pipe.stop()
     defer { buf.deallocate() }
-    try assertEqual(read, frames * 4)
-    let fp = buf.assumingMemoryBound(to: Float.self)
+    try assertEqual(read, frames * bpf)
+    // 解 3-byte LE int24 → float（±1 域）
+    let raw = buf.assumingMemoryBound(to: UInt8.self)
+    func sampleAt(_ i: Int) -> Float {
+        var v = Int32(raw[i * 3]) | (Int32(raw[i * 3 + 1]) << 8) | (Int32(raw[i * 3 + 2]) << 16)
+        if v & 0x800000 != 0 { v |= ~0xFFFFFF }
+        return Float(v) / 8388608.0
+    }
     var peaks = 0
     for i in 1..<(frames - 1) {
-        if fp[i] > fp[i - 1] && fp[i] >= fp[i + 1] && fp[i] > 0.2 { peaks += 1 }
+        let a = sampleAt(i - 1), b = sampleAt(i), c = sampleAt(i + 1)
+        if b > a && b >= c && b > 0.2 { peaks += 1 }
     }
     try assertGreaterThan(peaks, 175)
     try assertLessThan(peaks, 225)
     // 幅度保持（Kaiser sinc DC 归一 → 增益 ≈ 1）
     var peakVal: Float = 0
-    for i in 0..<frames { peakVal = max(peakVal, abs(fp[i])) }
+    for i in 0..<frames { peakVal = max(peakVal, abs(sampleAt(i))) }
     try assertEqualFloat(peakVal, 0.5, accuracy: 0.05)
 }
 
@@ -1010,7 +1230,8 @@ runTest("pipelineResamplesWhenDeviceLacksSourceRate") {
     try assertFalse(pipe.didMatchHardwareRate)
     try assertTrue(pipe.resampler != nil)
     try assertEqual(pipe.outputFormat.sampleRate, 48000.0)
-    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+    try assertEqual(pipe.outputFormat.sampleFormat, .int24)   // issue #9：整数量化点输出
+    try assertTrue(pipe.outputConverter != nil)
     pipe.stop()
 }
 
@@ -1189,7 +1410,9 @@ runTest("pipelineDSPEnabled") {
     prefs.replayGainDB = -3
     let pipeline = AudioPipeline(decoder: decoder, output: output, dspPreferences: prefs)
     try assertFalse(pipeline.dspChain.isBypass)
-    try assertEqual(pipeline.outputFormat.sampleFormat, .float32)
+    // issue #9：DSP 开启 ≠ float32 输出 — 转回整数（float 源默认 24-bit）
+    try assertEqual(pipeline.outputFormat.sampleFormat, .int24)
+    try assertTrue(pipeline.outputConverter != nil)
     try pipeline.start()
     Thread.sleep(forTimeInterval: 0.15)
     let frames = output.pullFrames(2048, bytesPerFrame: pipeline.outputFormat.bytesPerFrame)
@@ -1464,7 +1687,8 @@ runTest("pipelineDSPWithInt16Decoder") {
     let pipeline = AudioPipeline(decoder: decoder, output: output, dspPreferences: prefs)
 
     try assertFalse(pipeline.dspChain.isBypass)
-    try assertEqual(pipeline.outputFormat.sampleFormat, .float32)
+    // issue #9：int16 源 + DSP → 输出转回 int16（源原生位深），不再是 float32
+    try assertEqual(pipeline.outputFormat.sampleFormat, .int16)
     try pipeline.start()
     Thread.sleep(forTimeInterval: 0.3)
 
@@ -1474,17 +1698,20 @@ runTest("pipelineDSPWithInt16Decoder") {
     let read = pipeline.ringBuffer.read(into: readBuf, length: frames * bpf)
     pipeline.stop()
 
-    // Should have output some data (converted int16 → float32 → gain applied)
+    // Should have output some data (int16 → float32 → gain → int16)
     try assertGreaterThan(read, 0)
-    let fp = readBuf.assumingMemoryBound(to: Float.self)
-    let samplesRead = read / 4
-    // Check that values are reasonable float samples (not garbage)
-    var maxAbs: Float = 0
+    let ip = readBuf.assumingMemoryBound(to: Int16.self)
+    let samplesRead = read / 2
+    // int16 样本必须在合法范围内且非全零（-6dB 增益 ≈ 半幅）
+    var maxAbs: Int = 0
     for i in 0..<samplesRead {
-        maxAbs = max(maxAbs, abs(fp[i]))
+        maxAbs = max(maxAbs, Int(abs(Int32(ip[i]))))
     }
-    try assertGreaterThan(maxAbs, Float(0))
-    try assertLessThan(maxAbs, Float(1.5))  // should be well within range
+    try assertGreaterThan(maxAbs, 0)
+    try assertLessThan(maxAbs, 32768)  // no overflow, valid int16 range
+    // 源正弦幅度 ~0.5 满幅 → -6dB 后 ~0.25 → int16 ≈ 8192（宽容差）
+    try assertGreaterThan(maxAbs, 4000)
+    try assertLessThan(maxAbs, 14000)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -3461,7 +3688,7 @@ runTest("probeTooShortReturnsUnknown") {
 print("\n═══ CloudStreamSource Tests ═══")
 
 runTest("cloudStreamReadFromInjectedChunk") {
-    let client = QuarkAPIClient()
+    let client = QuarkAPIClient(keychain: InMemoryCookieStore())
     let totalBytes: Int64 = 1024
     let source = CloudStreamSource(client: client, fid: "test", fileSize: totalBytes,
                                    chunkSize: 256, prebufferBytes: 256)
@@ -3483,7 +3710,7 @@ runTest("cloudStreamReadFromInjectedChunk") {
 }
 
 runTest("cloudStreamReadAcrossChunkBoundary") {
-    let client = QuarkAPIClient()
+    let client = QuarkAPIClient(keychain: InMemoryCookieStore())
     let source = CloudStreamSource(client: client, fid: "x", fileSize: 512,
                                    chunkSize: 256, prebufferBytes: 256)
     let chunk0 = Data((0..<256).map { _ in UInt8(0xAA) })
@@ -3508,7 +3735,7 @@ runTest("cloudStreamReadAcrossChunkBoundary") {
 }
 
 runTest("cloudStreamSeekUpdatesPosition") {
-    let client = QuarkAPIClient()
+    let client = QuarkAPIClient(keychain: InMemoryCookieStore())
     let source = CloudStreamSource(client: client, fid: "x", fileSize: 1024,
                                    chunkSize: 256, prebufferBytes: 256)
     try source.seek(to: 500)
@@ -3518,7 +3745,7 @@ runTest("cloudStreamSeekUpdatesPosition") {
 }
 
 runTest("cloudStreamSeekRejectsOutOfBounds") {
-    let client = QuarkAPIClient()
+    let client = QuarkAPIClient(keychain: InMemoryCookieStore())
     let source = CloudStreamSource(client: client, fid: "x", fileSize: 100,
                                    chunkSize: 256, prebufferBytes: 256)
     try assertThrows(try source.seek(to: -1))
@@ -3526,7 +3753,7 @@ runTest("cloudStreamSeekRejectsOutOfBounds") {
 }
 
 runTest("cloudStreamReadAtEOFReturnsZero") {
-    let client = QuarkAPIClient()
+    let client = QuarkAPIClient(keychain: InMemoryCookieStore())
     let source = CloudStreamSource(client: client, fid: "x", fileSize: 100,
                                    chunkSize: 256, prebufferBytes: 0)
     try source.seek(to: 100)
@@ -3550,7 +3777,7 @@ runTest("prefetchTriggersBelowThreshold") {
         return (fid: "next-fid", fileSize: 5_000_000)
     }
     pm.cloudSourceBuilder = { fid, size in
-        let client = QuarkAPIClient()
+        let client = QuarkAPIClient(keychain: InMemoryCookieStore())
         return CloudStreamSource(client: client, fid: fid, fileSize: size,
                                  chunkSize: 256, prebufferBytes: 0)
     }
@@ -3570,7 +3797,7 @@ runTest("prefetchDoesNotTriggerAboveThreshold") {
         return (fid: "x", fileSize: 1024)
     }
     pm.cloudSourceBuilder = { fid, size in
-        let client = QuarkAPIClient()
+        let client = QuarkAPIClient(keychain: InMemoryCookieStore())
         return CloudStreamSource(client: client, fid: fid, fileSize: size,
                                  chunkSize: 256, prebufferBytes: 0)
     }
@@ -3587,7 +3814,7 @@ runTest("prefetchDedupesSameTrack") {
         return (fid: "stable-fid", fileSize: 1024)
     }
     pm.cloudSourceBuilder = { fid, size in
-        let client = QuarkAPIClient()
+        let client = QuarkAPIClient(keychain: InMemoryCookieStore())
         return CloudStreamSource(client: client, fid: fid, fileSize: size,
                                  chunkSize: 256, prebufferBytes: 0)
     }
@@ -3604,7 +3831,7 @@ runTest("prefetchConsumeMatchesFid") {
     let pm = CloudPrefetchManager(triggerThresholdSeconds: 30, prefetchBytes: 512)
     pm.nextCloudInfoProvider = { (fid: "fid-X", fileSize: 1024) }
     pm.cloudSourceBuilder = { fid, size in
-        let client = QuarkAPIClient()
+        let client = QuarkAPIClient(keychain: InMemoryCookieStore())
         return CloudStreamSource(client: client, fid: fid, fileSize: size,
                                  chunkSize: 256, prebufferBytes: 0)
     }
@@ -3840,16 +4067,24 @@ runTest("pipelineAppliesVolumeInDSPDomain") {
     pipe.setVolume(linearGain: 0.5)
     try pipe.start()
     Thread.sleep(forTimeInterval: 0.25)
+    // issue #9：ring 中是 int24（mono，BPF=3）— 音量作用在 float 域，
+    // 之后经 PCMOutputConverter 量化为整数
     let frames = 1024
-    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
+    let bpf = pipe.outputFormat.bytesPerFrame
+    try assertEqual(pipe.outputFormat.sampleFormat, .int24)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * bpf, alignment: 16)
     defer { buf.deallocate() }
-    let read = pipe.ringBuffer.read(into: buf, length: frames * 4)
-    try assertEqual(read, frames * 4)
-    let fp = buf.assumingMemoryBound(to: Float.self)
-    var peak: Float = 0
-    for i in 0..<frames { peak = max(peak, abs(fp[i])) }
-    // 0.5 振幅 × 0.5 增益 = 0.25 — 音量确实作用在 DSP float 域
-    try assertEqualFloat(peak, 0.25, accuracy: 0.02)
+    let read = pipe.ringBuffer.read(into: buf, length: frames * bpf)
+    try assertEqual(read, frames * bpf)
+    let raw = buf.assumingMemoryBound(to: UInt8.self)
+    var peakCode: Int32 = 0
+    for i in 0..<frames {
+        var v = Int32(raw[i * 3]) | (Int32(raw[i * 3 + 1]) << 8) | (Int32(raw[i * 3 + 2]) << 16)
+        if v & 0x800000 != 0 { v |= ~0xFFFFFF }
+        peakCode = max(peakCode, abs(v))
+    }
+    // 0.5 振幅 × 0.5 增益 = 0.25 → int24 ≈ 0.25 × 2^23 = 2097152
+    try assertEqualFloat(Float(peakCode), 2_097_152, accuracy: 200_000)
     pipe.stop()
 }
 

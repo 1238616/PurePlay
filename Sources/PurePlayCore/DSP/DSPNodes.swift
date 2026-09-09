@@ -429,6 +429,13 @@ public final class ParametricEQNode: DSPNode {
 
 /// TPDF Dither — adds triangular probability density function noise
 /// before truncation from higher to lower bit depth
+///
+/// **已停用（issue #9）**：在 float 域预量化 + 抖动后，CoreAudio HAL 还会
+/// 再做一次不带抖动的 float→int 量化 — 噪声整形形同虚设。真正的 dither
+/// 现由 `PCMOutputConverter` 在 float → 整数输出的实际量化点施加。
+/// 本类保留仅供单元测试与实验，`DSPChain.build` 不再自动接线。
+/// 另：`Float.random`（SystemRandomNumberGenerator）逐样本调用开销过高，
+/// PCMOutputConverter 用 xorshift32 取代。
 public final class DitherNode: DSPNode {
     public var isEnabled: Bool = true
     public let name = "Dither"
