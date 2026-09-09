@@ -213,6 +213,13 @@ public final class FLACMD5Verifier {
         }
     }
 
+    /// 原生位深容器输入（issue #14 后 CoreAudioDecoder 直接投递
+    /// int16/int24 packed）— FLAC 规范的 MD5 输入正是小端原生宽度
+    /// 逐声道交错样本，字节序与容器布局一致，原始字节直接喂入
+    public func updateRaw(_ bytes: UnsafeRawPointer, byteCount: Int) {
+        CC_MD5_Update(&context, bytes, CC_LONG(byteCount))
+    }
+
     public func finalize() -> [UInt8] {
         var digest = [UInt8](repeating: 0, count: 16)
         digest.withUnsafeMutableBufferPointer { p in

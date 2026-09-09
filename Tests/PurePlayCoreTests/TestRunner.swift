@@ -1,5 +1,8 @@
 import Foundation
 @testable import PurePlayCore
+#if canImport(AudioToolbox)
+import AudioToolbox   // issue #6 AAC packet-table 测试直接用 ExtAudioFile 合成 m4a
+#endif
 
 // ═══════════════════════════════════════════════════════
 // Lightweight test harness (no XCTest / no Xcode required)
@@ -1895,24 +1898,29 @@ runTest("coreAudioDecoderWithWAVFile") {
     let decoder = try CoreAudioDecoder(url: tmpFile)
     try assertEqual(decoder.format.sampleRate, 44100.0)
     try assertEqual(decoder.format.channels, 2)
-    // Integer source → int32 container, UI bit depth = source native (16)
-    try assertEqual(decoder.format.sampleFormat, .int32)
+    // issue #14: integer source → NATIVE int16 packed container (was int32)
+    try assertEqual(decoder.format.sampleFormat, .int16)
     try assertEqual(decoder.format.bitDepth, 16)
-    try assertEqual(decoder.format.containerBitDepth, 32)
+    try assertEqual(decoder.format.containerBitDepth, 16)
     try assertEqual(decoder.totalFrames, Int64(frames))
     try assertFalse(decoder.isAtEnd)
 
-    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 8, alignment: 16)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
     defer { buf.deallocate() }
     let decoded = try decoder.decode(into: buf, maxFrames: frames)
     try assertEqual(decoded, frames)
     try assertTrue(decoder.isAtEnd)
 
-    // int32 samples (sine peak should be sizable)
-    let ip = buf.assumingMemoryBound(to: Int32.self)
-    var maxAbs: Int32 = 0
-    for i in 0..<(decoded * 2) { maxAbs = max(maxAbs, abs(ip[i])) }
-    try assertGreaterThan(Int(maxAbs), 1_000_000)  // 440Hz sine in int32 should be well above noise
+    // int16 samples (sine peak should be sizable)
+    let ip = buf.assumingMemoryBound(to: Int16.self)
+    var maxAbs: Int = 0
+    for i in 0..<(decoded * 2) { maxAbs = max(maxAbs, Int(abs(Int32(ip[i])))) }
+    try assertGreaterThan(maxAbs, 10_000)  // 440Hz sine amplitude ~16000
+
+    // bit-perfect passthrough: native int16 container == raw WAV payload
+    let originalPCM = wavData.subdata(in: 44..<(44 + frames * 4))
+    let decodedData = Data(bytes: buf, count: frames * 4)
+    try assertEqual(decodedData, originalPCM, "int16 native decode must be bit-identical to WAV payload")
 
     decoder.close()
 }
@@ -1956,12 +1964,181 @@ runTest("coreAudioDecoderReportsSourceBitDepth16") {
     defer { try? FileManager.default.removeItem(at: tmpFile) }
 
     let decoder = try CoreAudioDecoder(url: tmpFile)
-    // UI bit depth reflects source, ASBD container is 32
+    // issue #14: UI bit depth AND ASBD container are both source-native (16)
     try assertEqual(decoder.format.bitDepth, 16)
-    try assertEqual(decoder.format.containerBitDepth, 32)
-    try assertEqual(decoder.format.sampleFormat, .int32)
+    try assertEqual(decoder.format.containerBitDepth, 16)
+    try assertEqual(decoder.format.sampleFormat, .int16)
     decoder.close()
 }
+
+// ─── issue #6: MP3 Xing/LAME encoder delay & padding parser ───
+
+/// 合成 MP3 首帧 + Xing/Info tag（含 LAME 魔数与 delay/padding 字段）。
+/// 帧头: FF FB = MPEG1 Layer III；h2=0x91 → protection_absent（无 CRC）；
+/// h3=0x00 stereo / 0xC0 mono。tagPos = 帧头 4 + side info(32/17)。
+func makeSyntheticMP3Header(id3Size: Int = 0, mono: Bool = false, crcPresent: Bool = false,
+                            xing: Bool = false, writeTag: Bool = true, lameMagic: Bool = true,
+                            delay: Int = 576, padding: Int = 1152) -> Data {
+    var bytes = [UInt8](repeating: 0, count: 600)
+    var p = 0
+    if id3Size > 0 {
+        bytes[0] = 0x49; bytes[1] = 0x44; bytes[2] = 0x33   // "ID3"
+        bytes[3] = 4; bytes[4] = 0; bytes[5] = 0            // v2.4, no flags
+        bytes[6] = UInt8((id3Size >> 21) & 0x7F)            // synchsafe size
+        bytes[7] = UInt8((id3Size >> 14) & 0x7F)
+        bytes[8] = UInt8((id3Size >> 7) & 0x7F)
+        bytes[9] = UInt8(id3Size & 0x7F)
+        for k in 10..<(10 + id3Size) { bytes[k] = 0x20 }    // padding body (no sync bytes)
+        p = 10 + id3Size
+    }
+    bytes[p] = 0xFF
+    bytes[p + 1] = 0xFB                       // MPEG1, Layer III
+    bytes[p + 2] = crcPresent ? 0x90 : 0x91   // bit0=0 → CRC present (headerSize 6)
+    bytes[p + 3] = mono ? 0xC0 : 0x00         // channel mode
+    let headerSize = 4 + (crcPresent ? 2 : 0)
+    let sideSize = mono ? 17 : 32             // MPEG1
+    let tagPos = p + headerSize + sideSize
+    if writeTag {
+        let magic = xing ? "Xing" : "Info"
+        for (k, c) in magic.utf8.enumerated() { bytes[tagPos + k] = UInt8(c) }
+        bytes[tagPos + 7] = 0x07              // flags: frames/bytes/TOC present
+        if lameMagic {
+            for (k, c) in "LAME3.99.5".utf8.enumerated() { bytes[tagPos + 120 + k] = UInt8(c) }
+        }
+        bytes[tagPos + 213] = UInt8((delay >> 4) & 0xFF)
+        bytes[tagPos + 214] = UInt8(((delay & 0x0F) << 4) | ((padding >> 8) & 0x0F))
+        bytes[tagPos + 215] = UInt8(padding & 0xFF)
+    }
+    return Data(bytes)
+}
+
+runTest("mp3LameTagParserStereoInfo") {
+    // MPEG1 stereo, no CRC, "Info" (CBR) tag → tagPos = 0+4+32 = 36
+    let data = makeSyntheticMP3Header(delay: 576, padding: 1152)
+    let r = CoreAudioDecoder.parseMP3EncoderDelayPadding(data)
+    try assertTrue(r != nil, "LAME tag must parse")
+    try assertEqual(r?.delay, 576)
+    try assertEqual(r?.padding, 1152)
+}
+
+runTest("mp3LameTagParserMonoXingWithID3") {
+    // ID3v2 (size 20) + MPEG1 mono + "Xing" (VBR) → tagPos = 30+4+17 = 51
+    let data = makeSyntheticMP3Header(id3Size: 20, mono: true, xing: true,
+                                      delay: 529, padding: 1152)
+    let r = CoreAudioDecoder.parseMP3EncoderDelayPadding(data)
+    try assertTrue(r != nil, "LAME tag after ID3v2 must parse")
+    try assertEqual(r?.delay, 529)
+    try assertEqual(r?.padding, 1152)
+}
+
+runTest("mp3LameTagParserCRCPresent") {
+    // CRC present → headerSize 6 → tagPos = 0+6+32 = 38
+    let data = makeSyntheticMP3Header(crcPresent: true, delay: 1152, padding: 576)
+    let r = CoreAudioDecoder.parseMP3EncoderDelayPadding(data)
+    try assertTrue(r != nil, "CRC-present frame must parse")
+    try assertEqual(r?.delay, 1152)
+    try assertEqual(r?.padding, 576)
+}
+
+runTest("mp3LameTagParserRejectsInvalid") {
+    // 非 LAME（无魔数）→ 不信任 delay 字段
+    let noLame = makeSyntheticMP3Header(lameMagic: false)
+    try assertTrue(CoreAudioDecoder.parseMP3EncoderDelayPadding(noLame) == nil)
+    // 无 Xing/Info tag
+    let noTag = makeSyntheticMP3Header(writeTag: false)
+    try assertTrue(CoreAudioDecoder.parseMP3EncoderDelayPadding(noTag) == nil)
+    // 纯垃圾（无帧同步）
+    let junk = Data(repeating: 0x41, count: 600)
+    try assertTrue(CoreAudioDecoder.parseMP3EncoderDelayPadding(junk) == nil)
+    // 数据过短
+    let short = Data(repeating: 0, count: 100)
+    try assertTrue(CoreAudioDecoder.parseMP3EncoderDelayPadding(short) == nil)
+}
+
+// ─── issue #6: AAC packet table → 逻辑总帧数（去尾部 padding）───
+
+runTest("coreAudioAACPacketTableTrimsPadding") {
+    // 用 AudioToolbox 自带 AAC 编码器合成一个 m4a：写 N 帧，
+    // 编码器补齐整 packet（1024 帧/packet）→ FileLengthFrames > N；
+    // packet table 的 mNumberValidFrames == N → decoder.totalFrames 必须等于 N
+    let frames = 44100
+    let tmpFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pureplay_aac_pt_\(UUID().uuidString).m4a")
+    defer { try? FileManager.default.removeItem(at: tmpFile) }
+
+    var fileFormat = AudioStreamBasicDescription(
+        mSampleRate: 44100, mFormatID: kAudioFormatMPEG4AAC,
+        mFormatFlags: 0, mBytesPerPacket: 0, mFramesPerPacket: 1024,
+        mBytesPerFrame: 0, mChannelsPerFrame: 2, mBitsPerChannel: 0, mReserved: 0)
+    var writer: ExtAudioFileRef?
+    var st = ExtAudioFileCreateWithURL(tmpFile as CFURL, kAudioFileM4AType,
+                                       &fileFormat, nil, 0, &writer)
+    guard st == noErr, let wref = writer else {
+        print("    SKIP: AAC encoder unavailable (status \(st))")
+        return
+    }
+    var client = AudioStreamBasicDescription(
+        mSampleRate: 44100, mFormatID: kAudioFormatLinearPCM,
+        mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+        mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+        mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
+    ExtAudioFileSetProperty(wref, kExtAudioFileProperty_ClientDataFormat,
+                            UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &client)
+    let pcm = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
+    defer { pcm.deallocate() }
+    let sp = pcm.assumingMemoryBound(to: Int16.self)
+    for i in 0..<(frames * 2) { sp[i] = Int16((i % 200 < 100) ? 12000 : -12000) }
+    var abl = AudioBufferList(mNumberBuffers: 1,
+                              mBuffers: AudioBuffer(mNumberChannels: 2,
+                                                    mDataByteSize: UInt32(frames * 4),
+                                                    mData: pcm))
+    st = ExtAudioFileWrite(wref, UInt32(frames), &abl)
+    ExtAudioFileDispose(wref)
+    guard st == noErr else {
+        print("    SKIP: AAC write failed (status \(st))")
+        return
+    }
+
+    let decoder = try CoreAudioDecoder(url: tmpFile)
+    defer { decoder.close() }
+    // 关键断言：totalFrames 来自 packet table 有效帧数，不是补齐后的文件帧数
+    try assertEqual(decoder.totalFrames, Int64(frames))
+
+    // 能完整解码 totalFrames 帧（compressed 源 → int32 容器）
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 8, alignment: 16)
+    defer { buf.deallocate() }
+    var got = 0
+    while got < frames && !decoder.isAtEnd {
+        let n = try decoder.decode(into: buf + got * 8, maxFrames: min(4096, frames - got))
+        if n <= 0 { break }
+        got += n
+    }
+    try assertEqual(got, frames)
+    try assertTrue(decoder.isAtEnd)
+}
+
+// ─── issue #15c: 非本地源不再落临时文件，主动让路 FFmpeg ───
+
+#if canImport(CFFmpeg)
+runTest("coreAudioNonLocalSourceRoutesToFFmpeg") {
+    let src = MemorySource(data: Data(repeating: 0x42, count: 1024))
+    try assertThrows(try CoreAudioDecoder(source: src, fileExtension: "m4a"))
+    try assertThrows(try CoreAudioDecoder(source: src, fileExtension: "mp3"))
+    // 本地源不受影响，仍走 ExtAudioFile
+    let wav = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: 100)
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pureplay_local_route_\(UUID().uuidString).wav")
+    try wav.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let d = try CoreAudioDecoder(source: try LocalFileSource(url: tmp), fileExtension: "wav")
+    try assertEqual(d.format.sampleFormat, .int16)
+    d.close()
+    // registry 降级链的落点：FFmpeg 工厂现在认识 m4a/mp3/aac
+    try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "m4a"))
+    try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "mp3"))
+    try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "aac"))
+}
+#endif
 #endif
 
 // ═══════════════════════════════════════════════════════
@@ -4681,6 +4858,15 @@ runTest("ffmpegDecoderFactoryExtensions") {
     try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("ogg"))
     try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("wma"))
     try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("mka"))
+    // issue #15c: 云端流让路后 registry 降级链的落点 — 必须认识这些扩展
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("mp3"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("m4a"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("mp4"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("aac"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("flac"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("alac"))
+    try assertTrue(FFmpegDecoderFactory.supportedExtensions.contains("caf"))
+    // 优先级仍低于原生解码器 — 本地文件路由不变
     try assertEqual(FFmpegDecoderFactory.priority, 80)
 }
 
@@ -4688,8 +4874,8 @@ runTest("ffmpegDecoderFactoryCanDecode") {
     let src = MemorySource(data: Data(repeating: 0, count: 100))
     try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "ape"))
     try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "wv"))
+    try assertTrue(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "flac"))  // issue #15c
     try assertFalse(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "wav"))
-    try assertFalse(FFmpegDecoderFactory.canDecode(source: src, fileExtension: "flac"))
 }
 
 runTest("ffmpegDecoderRegistryPriority") {

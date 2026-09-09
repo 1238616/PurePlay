@@ -357,8 +357,14 @@ public final class FFmpegDecoder: AudioDecoder {
 // MARK: - Factory
 
 public enum FFmpegDecoderFactory: DecoderFactory {
+    // issue #15c：mp3/m4a/mp4/aac/flac/alac/caf 也列入 — 优先级 80 仍低于
+    // 原生解码器（WAV/AIFF/LibFLAC 100、ALAC/DSF/DFF 95、CoreAudio 90），
+    // 本地文件不受影响；仅当 CoreAudioDecoder 对**非本地源**（云端流）
+    // 主动让路时，registry 降级链才落到这里 — FFmpegAVIOAdapter 支持流式，
+    // 边下边播，无需整曲落临时文件。
     public static let supportedExtensions: Set<String> = [
-        "ape", "wv", "tta", "opus", "ogg", "wma", "mka", "dts"
+        "ape", "wv", "tta", "opus", "ogg", "wma", "mka", "dts",
+        "mp3", "m4a", "mp4", "aac", "flac", "alac", "caf"
     ]
     public static let priority: Int = 80
 
