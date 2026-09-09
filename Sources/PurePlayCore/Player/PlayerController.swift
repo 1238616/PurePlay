@@ -304,18 +304,47 @@ public final class PlayerController: @unchecked Sendable {
         }
     }
 
+    /// issue #11: 解析播放目标 — CUE 虚拟路径（CueVirtualPath 编码）
+    /// 返回底层真实音频 URL 与对应轨的时间窗；普通路径原样返回
+    private func resolveLocalPlaybackTarget(_ url: URL) -> (audioURL: URL, cueTrack: CueTrack?) {
+        if let virt = CueVirtualPath.decode(url.path),
+           let loaded = CueLoader.load(cueURL: URL(fileURLWithPath: virt.cuePath)),
+           let t = loaded.sheet.tracks.first(where: { $0.number == virt.trackNumber }) {
+            return (loaded.audioURL, t)
+        }
+        return (url, nil)
+    }
+
+    /// issue #11: CUE 轨窗口包装 — startSeconds/endSeconds × sampleRate
+    /// 换算成帧范围，交给 TrimmingDecoder；包装失败时关闭内层解码器防泄漏
+    private func applyCueTrimming(_ decoder: AudioDecoder, track: CueTrack?) throws -> AudioDecoder {
+        guard let t = track else { return decoder }
+        let rate = decoder.format.sampleRate
+        do {
+            return try TrimmingDecoder(inner: decoder,
+                                       startFrame: Int64(t.startSeconds * rate),
+                                       endFrame: t.endSeconds.map { Int64($0 * rate) })
+        } catch {
+            decoder.close()
+            throw error
+        }
+    }
+
     /// 播放本地文件
     public func playLocal(url: URL) throws {
         stop()
-        let ext = url.pathExtension.lowercased()
-        let source = try LocalFileSource(url: url)
+        // issue #11: CUE 虚拟轨 → 真实音频文件 + TrimmingDecoder 窗口
+        let target = resolveLocalPlaybackTarget(url)
+        let ext = target.audioURL.pathExtension.lowercased()
+        let source = try LocalFileSource(url: target.audioURL)
         // issue #10：DSD 按 DAC 能力选 DoP / DSD2PCM 回退
-        let (decoder, basePrefs) = try makeDecoderApplyingDSDStrategy(
+        let (innerDecoder, basePrefs) = try makeDecoderApplyingDSDStrategy(
             source: source, fileExtension: ext)
+        let decoder = try applyCueTrimming(innerDecoder, track: target.cueTrack)
         var effectivePrefs = basePrefs
-        // issue #8：ReplayGain 接线 — 本地文件起播时直接读 tag
+        // issue #8：ReplayGain 接线 — 本地文件起播时直接读 tag（CUE 轨读镜像 tag）
         lastReplayGainDB = nil
-        if let rg = replayGainDB(for: url, isDSD: decoder.format.isDSD) {
+        if let rg = replayGainDB(for: target.audioURL, isDSD: decoder.format.isDSD) {
             effectivePrefs.replayGainEnabled = true
             effectivePrefs.replayGainDB = rg
             // 应用 ReplayGain 必然走 DSP float 链，bit-perfect 语义不再成立
@@ -550,11 +579,15 @@ public final class PlayerController: @unchecked Sendable {
         guard let idx = nextTrackIndex() else { return false }
         let next = queue[idx]
         guard case .local(let url) = next else { return false }
-        let ext = url.pathExtension.lowercased()
+        // issue #11: gapless 衔接同样要解析 CUE 虚拟轨（同专辑相邻轨
+        // 格式一致 → 窗口 swap 无缝）
+        let target = resolveLocalPlaybackTarget(url)
+        let ext = target.audioURL.pathExtension.lowercased()
         var dec: AudioDecoder?
         do {
-            let src = try LocalFileSource(url: url)
-            dec = try DecoderRegistry.shared.makeDecoder(source: src, fileExtension: ext)
+            let src = try LocalFileSource(url: target.audioURL)
+            let raw = try DecoderRegistry.shared.makeDecoder(source: src, fileExtension: ext)
+            dec = try applyCueTrimming(raw, track: target.cueTrack)
             guard pipe.canSwapDecoder(dec!) else {
                 dec!.close()
                 return false

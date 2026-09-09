@@ -18,22 +18,44 @@ public protocol CookieStoring: AnyObject {
 }
 
 /// 内存 Cookie 存储 — 单元测试专用，进程结束即消失，不触碰系统钥匙串
+///
+/// QuarkAPIClient 的并发网络任务会同时 save/clear（checkAuthStatus 与
+/// refreshCookies 在不同 Task 上）— 无锁 Dictionary 竞争曾导致
+/// objc_msgSend 野指针崩溃（run21 Thread 9）。NSLock 保护全部读写。
 public final class InMemoryCookieStore: CookieStoring {
+    private let lock = NSLock()
     private var store: [String: Data] = [:]
     public init() {}
 
-    public func save(key: String, data: Data) throws { store[key] = data }
-    public func load(key: String) -> Data? { store[key] }
-    public func delete(key: String) { store.removeValue(forKey: key) }
+    public func save(key: String, data: Data) throws {
+        lock.lock(); defer { lock.unlock() }
+        store[key] = data
+    }
+    public func load(key: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        return store[key]
+    }
+    public func delete(key: String) {
+        lock.lock(); defer { lock.unlock() }
+        store.removeValue(forKey: key)
+    }
 
     public func saveCookies(_ cookies: [String: String]) throws {
-        store["cookies"] = try JSONEncoder().encode(cookies)
+        let data = try JSONEncoder().encode(cookies)
+        lock.lock(); defer { lock.unlock() }
+        store["cookies"] = data
     }
     public func loadCookies() -> [String: String]? {
-        guard let data = store["cookies"] else { return nil }
+        lock.lock()
+        let data = store["cookies"]
+        lock.unlock()
+        guard let data else { return nil }
         return try? JSONDecoder().decode([String: String].self, from: data)
     }
-    public func clearCookies() { store.removeValue(forKey: "cookies") }
+    public func clearCookies() {
+        lock.lock(); defer { lock.unlock() }
+        store.removeValue(forKey: "cookies")
+    }
 }
 
 /// macOS Keychain 封装 — 安全存储夸克网盘 Cookie

@@ -22,9 +22,13 @@ final class IncrementalScanner {
     }
     
     /// Perform a full scan of the directory
+    ///
+    /// issue #11: 同时检测 .cue 文件 — 有效 CUE（单 FILE、引用可解析）
+    /// 会把被引用的整轨镜像从结果中剔除，替换为 N 个虚拟轨 URL
+    /// （filePath 编码见 CueVirtualPath）
     func fullScan(directory: URL) throws -> [URL] {
         let fileManager = FileManager.default
-        
+
         guard let enumerator = fileManager.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
@@ -32,19 +36,44 @@ final class IncrementalScanner {
         ) else {
             throw NSError(domain: "IncrementalScanner", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to create enumerator"])
         }
-        
+
         var audioFiles: [URL] = []
-        
+        var cueFiles: [URL] = []
+
         for case let fileURL as URL in enumerator {
             let resourceValues = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
-            
+
             guard resourceValues.isRegularFile == true else { continue }
+            if fileURL.pathExtension.lowercased() == "cue" {
+                cueFiles.append(fileURL)
+                continue
+            }
             guard isAudioFile(fileURL) else { continue }
-            
+
             audioFiles.append(fileURL)
         }
-        
-        return audioFiles
+
+        // CUE 展开：被覆盖的镜像文件不再作为独立曲目入库
+        var coveredAudioPaths = Set<String>()
+        var virtualTracks: [URL] = []
+        for cueURL in cueFiles {
+            guard let loaded = CueLoader.load(cueURL: cueURL) else { continue }
+            let audioPath = loaded.audioURL.path
+            // 同一音频被多个 CUE 引用时首个生效（避免重复虚拟轨）
+            guard !coveredAudioPaths.contains(audioPath) else { continue }
+            coveredAudioPaths.insert(audioPath)
+            for track in loaded.sheet.tracks {
+                let encoded = CueVirtualPath.encode(audioPath: audioPath,
+                                                    cuePath: cueURL.path,
+                                                    trackNumber: track.number)
+                virtualTracks.append(URL(fileURLWithPath: encoded))
+            }
+        }
+        if !coveredAudioPaths.isEmpty {
+            audioFiles.removeAll { coveredAudioPaths.contains($0.path) }
+        }
+
+        return audioFiles + virtualTracks
     }
     
     /// Perform an incremental scan to detect changes since last scan
@@ -69,7 +98,10 @@ final class IncrementalScanner {
         
         for fileURL in currentFiles {
             guard existingPaths.contains(fileURL.path) else { continue }
-            
+            // issue #11: CUE 虚拟轨路径在磁盘上不存在 — 跳过 mtime 比对
+            // （底层镜像 / .cue 变更由各自真实路径的增删检测覆盖）
+            guard !CueVirtualPath.isVirtual(fileURL.path) else { continue }
+
             let resourceValues = try fileURL.resourceValues(forKeys: [.contentModificationDateKey])
             guard let modificationDate = resourceValues.contentModificationDate else { continue }
             

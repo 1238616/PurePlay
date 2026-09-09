@@ -90,14 +90,23 @@ public final class QuarkAPIClient: @unchecked Sendable {
         + "AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.14.2 "
         + "Chrome/112.0.5615.165 Electron/24.1.3.8 Safari/537.36"
 
-    private var cookies: [String: String] = [:]
+    /// cookies / isLoggedIn 会被多个并发网络任务同时读写（每个请求的
+    /// refreshCookies / checkAuthStatus 都在独立 Task 上跑）— 无保护的
+    /// Dictionary CoW 竞争曾导致 objc_msgSend 野指针崩溃。
+    /// `@unchecked Sendable` 承诺了线程安全，用 NSLock 兑现。
+    private let stateLock = NSLock()
+    private var _cookies: [String: String] = [:]
+    private var _isLoggedIn: Bool = false
     private let session: URLSession
     private let rateLimiter: RateLimiter
     /// Cookie 存储（CookieStoring 抽象 — 测试注入 InMemoryCookieStore，
     /// 避免 SecItemCopyMatching 触发系统授权弹窗把后台测试进程挂死）
     private let keychain: CookieStoring
 
-    public private(set) var isLoggedIn: Bool = false
+    public var isLoggedIn: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _isLoggedIn
+    }
 
     public init(rateLimiter: RateLimiter = RateLimiter(),
                 keychain: CookieStoring = KeychainStore()) {
@@ -109,22 +118,26 @@ public final class QuarkAPIClient: @unchecked Sendable {
         self.keychain = keychain
 
         if let saved = keychain.loadCookies() {
-            self.cookies = saved
-            self.isLoggedIn = !saved.isEmpty
+            self._cookies = saved
+            self._isLoggedIn = !saved.isEmpty
         }
     }
 
     // MARK: - Auth
 
     public func setCookies(_ cookies: [String: String]) {
-        self.cookies = cookies
-        self.isLoggedIn = !cookies.isEmpty
+        stateLock.lock()
+        self._cookies = cookies
+        self._isLoggedIn = !cookies.isEmpty
+        stateLock.unlock()
         try? keychain.saveCookies(cookies)
     }
 
     public func logout() {
-        cookies = [:]
-        isLoggedIn = false
+        stateLock.lock()
+        _cookies = [:]
+        _isLoggedIn = false
+        stateLock.unlock()
         keychain.clearCookies()
     }
 
@@ -295,13 +308,16 @@ public final class QuarkAPIClient: @unchecked Sendable {
         let headerFields = httpResp.allHeaderFields as? [String: String] ?? [:]
         let parsedCookies = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: url)
 
+        stateLock.lock()
         for cookie in parsedCookies {
             if cookie.name.hasPrefix("__") || cookie.name.hasPrefix("QK") {
-                cookies[cookie.name] = cookie.value
+                _cookies[cookie.name] = cookie.value
             }
         }
+        let snapshot = _cookies
+        stateLock.unlock()
 
-        try? keychain.saveCookies(cookies)
+        try? keychain.saveCookies(snapshot)
     }
 
     /// 检测 Cookie 是否失效。识别策略：
@@ -335,8 +351,10 @@ public final class QuarkAPIClient: @unchecked Sendable {
             }
         }
         if expired {
-            cookies = [:]
-            isLoggedIn = false
+            stateLock.lock()
+            _cookies = [:]
+            _isLoggedIn = false
+            stateLock.unlock()
             keychain.clearCookies()
             let cb = onAuthExpired
             DispatchQueue.main.async { cb?() }
@@ -344,6 +362,7 @@ public final class QuarkAPIClient: @unchecked Sendable {
     }
 
     private var cookieHeader: String {
-        cookies.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _cookies.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
     }
 }

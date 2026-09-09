@@ -164,6 +164,16 @@ final class ScanService {
     
     /// Create a TrackRecord from a file URL
     private func createTrackRecord(from url: URL, existingId: Int64? = nil) throws -> TrackRecord {
+        // issue #11: CUE 虚拟轨 — 元数据来自 .cue（TITLE/PERFORMER/轨号）
+        // 与底层真实音频文件（采样率/位深/封面/专辑信息兜底）
+        if let virt = CueVirtualPath.decode(url.path) {
+            guard let track = try createCueTrackRecord(virtual: virt, existingId: existingId) else {
+                throw NSError(domain: "ScanService", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "CUE track unresolvable: \(url.path)"])
+            }
+            return track
+        }
+
         let fileManager = FileManager.default
         let attributes = try fileManager.attributesOfItem(atPath: url.path)
         
@@ -212,6 +222,76 @@ final class ScanService {
         return track
     }
     
+    /// issue #11: 从 CUE 虚拟路径构造 TrackRecord
+    /// - Returns: nil 当 .cue 不可解析或轨号不存在
+    private func createCueTrackRecord(
+        virtual: (audioPath: String, cuePath: String, trackNumber: Int),
+        existingId: Int64?
+    ) throws -> TrackRecord? {
+        let cueURL = URL(fileURLWithPath: virtual.cuePath)
+        guard let loaded = CueLoader.load(cueURL: cueURL),
+              let cueTrack = loaded.sheet.tracks.first(where: { $0.number == virtual.trackNumber })
+        else { return nil }
+
+        let audioURL = loaded.audioURL
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: audioURL.path)) ?? [:]
+        let fileSize = attrs[.size] as? Int64 ?? 0
+        let modificationDate = attrs[.modificationDate] as? Date ?? Date()
+        let metadata = MetadataReader.readMetadata(from: audioURL) ?? TrackMetadata(duration: 0)
+
+        // 时长：非末轨 = end - start；末轨 = 镜像总时长 - start
+        let duration: Double
+        if let end = cueTrack.endSeconds {
+            duration = max(0, end - cueTrack.startSeconds)
+        } else {
+            duration = max(0, metadata.duration - cueTrack.startSeconds)
+        }
+
+        let coverArtPath = CoverArtManager.shared.extractAndCacheCoverArt(
+            for: audioURL, trackId: existingId ?? 0)
+
+        var track = TrackRecord(
+            id: existingId,
+            filePath: CueVirtualPath.encode(audioPath: virtual.audioPath,
+                                            cuePath: virtual.cuePath,
+                                            trackNumber: virtual.trackNumber),
+            fileName: audioURL.lastPathComponent,
+            title: cueTrack.title.isEmpty ? "Track \(cueTrack.number)" : cueTrack.title,
+            artist: cueTrack.performer.isEmpty ? (metadata.artist ?? "Unknown Artist")
+                                               : cueTrack.performer,
+            album: loaded.sheet.albumTitle.isEmpty ? (metadata.album ?? "Unknown Album")
+                                                   : loaded.sheet.albumTitle,
+            albumArtist: loaded.sheet.albumPerformer.isEmpty
+                ? (metadata.albumArtist ?? metadata.artist ?? "Unknown Artist")
+                : loaded.sheet.albumPerformer,
+            genre: metadata.genre ?? "Unknown Genre",
+            year: metadata.year,
+            trackNumber: cueTrack.number,
+            discNumber: metadata.discNumber,
+            duration: duration,
+            sampleRate: metadata.sampleRate ?? 44100.0,
+            bitDepth: metadata.bitDepth ?? 16,
+            channels: metadata.channels ?? 2,
+            fileSize: fileSize,
+            fileModified: modificationDate,
+            dateAdded: Date(),
+            lastPlayed: nil,
+            playCount: 0,
+            isFavorite: false,
+            coverArtPath: coverArtPath
+        )
+
+        if let existingId = existingId,
+           let existing = try databaseManager.track(byId: existingId) {
+            track.dateAdded = existing.dateAdded
+            track.lastPlayed = existing.lastPlayed
+            track.playCount = existing.playCount
+            track.isFavorite = existing.isFavorite
+        }
+
+        return track
+    }
+
     /// Get list of currently watched directories
     var watchedDirectories: [URL] {
         return watchers.keys.map { URL(fileURLWithPath: $0) }

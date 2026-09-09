@@ -157,6 +157,69 @@ public struct CueSheet: Sendable, Equatable {
     }
 }
 
+/// CUE 虚拟轨的 filePath 编码（issue #11）
+///
+/// TrackRecord.filePath 是 unique 约束，而一张整轨镜像（album.flac）+
+/// 一个 .cue 会派生出 N 个逻辑轨 — 把 CUE 来源与轨号编码进路径：
+///
+///     <audioPath>#cue#<cuePath>#cue#<trackNumber>
+///
+/// 解码时从右向左切分（trackNumber 必为整数，天然右锚定），
+/// 普通路径不含 "#cue#<int>" 结尾 → decode 返回 nil，零误判。
+public enum CueVirtualPath {
+    public static let separator = "#cue#"
+
+    public static func encode(audioPath: String, cuePath: String, trackNumber: Int) -> String {
+        "\(audioPath)\(separator)\(cuePath)\(separator)\(trackNumber)"
+    }
+
+    public static func decode(_ path: String) -> (audioPath: String, cuePath: String, trackNumber: Int)? {
+        guard let lastSep = path.range(of: separator, options: .backwards),
+              let trackNumber = Int(path[lastSep.upperBound...]) else { return nil }
+        let prefix = String(path[..<lastSep.lowerBound])
+        guard let midSep = prefix.range(of: separator, options: .backwards) else { return nil }
+        let audioPath = String(prefix[..<midSep.lowerBound])
+        let cuePath = String(prefix[midSep.upperBound...])
+        guard !audioPath.isEmpty, !cuePath.isEmpty else { return nil }
+        return (audioPath, cuePath, trackNumber)
+    }
+
+    public static func isVirtual(_ path: String) -> Bool {
+        decode(path) != nil
+    }
+}
+
+/// .cue 文件加载与音频引用解析（issue #11）
+public enum CueLoader {
+    /// 解析 .cue 并解析其 FILE 引用的音频文件。
+    /// 相对路径以 .cue 所在目录为基准。引用文件不存在 / 解析失败 → nil。
+    /// 多 FILE 的 CUE 首版不支持（CueSheet.parse 只保留最后一个 FILE）。
+    public static func load(cueURL: URL) -> (sheet: CueSheet, audioURL: URL)? {
+        let data = (try? Data(contentsOf: cueURL)) ?? Data()
+        guard !data.isEmpty else { return nil }
+        // CUE 常见编码：UTF-8（可带 BOM）、GBK/Latin-1 兜底
+        var text: String?
+        if data.starts(with: [0xEF, 0xBB, 0xBF]),
+           let s = String(data: data.dropFirst(3), encoding: .utf8) {
+            text = s
+        } else {
+            text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .isoLatin1)
+        }
+        guard let content = text,
+              let sheet = CueSheet.parse(content),
+              !sheet.audioFileRef.isEmpty,
+              !sheet.tracks.isEmpty else { return nil }
+
+        let ref = sheet.audioFileRef
+        let audioURL = ref.hasPrefix("/")
+            ? URL(fileURLWithPath: ref)
+            : cueURL.deletingLastPathComponent().appendingPathComponent(ref)
+        guard FileManager.default.fileExists(atPath: audioURL.path) else { return nil }
+        return (sheet, audioURL)
+    }
+}
+
 /// 把任意 AudioDecoder 限制到 [startFrame, endFrame) 范围内
 ///
 /// 用于 CUE 分轨：上层根据 CueTrack.startSeconds × sampleRate 推算 startFrame，

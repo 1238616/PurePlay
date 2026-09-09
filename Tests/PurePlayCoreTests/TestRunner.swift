@@ -3547,6 +3547,134 @@ runTest("trimmingDecoderEndDefaultsToInnerEnd") {
     try assertEqual(trim.totalFrames, 512)
 }
 
+// ─── issue #11: CUE 虚拟轨接线（编码 / 扫描 / 播放窗口）───
+
+runTest("cueVirtualPathRoundTrip") {
+    let encoded = CueVirtualPath.encode(audioPath: "/music/album.flac",
+                                        cuePath: "/music/album.cue",
+                                        trackNumber: 7)
+    let decoded = CueVirtualPath.decode(encoded)
+    try assertTrue(decoded != nil)
+    try assertEqual(decoded?.audioPath, "/music/album.flac")
+    try assertEqual(decoded?.cuePath, "/music/album.cue")
+    try assertEqual(decoded?.trackNumber, 7)
+    try assertTrue(CueVirtualPath.isVirtual(encoded))
+    // 普通路径 / 残缺编码不误判
+    try assertFalse(CueVirtualPath.isVirtual("/music/album.flac"))
+    try assertTrue(CueVirtualPath.decode("/music/al#cue#bum.flac") == nil)
+    try assertTrue(CueVirtualPath.decode("onlyone#cue#/x.cue") == nil)
+    // 路径本身含 # 的极端情况（音频文件名带 #cue# 前缀段仍可右锚定解析）
+    let tricky = CueVirtualPath.encode(audioPath: "/a#1/x.flac", cuePath: "/a#1/x.cue", trackNumber: 1)
+    try assertEqual(CueVirtualPath.decode(tricky)?.audioPath, "/a#1/x.flac")
+}
+
+#if canImport(AudioToolbox)
+/// 生成 wav + cue 的临时目录；cue 用相对文件名引用
+private func makeCueFixture(frames: Int, cueBody: String) throws -> (dir: URL, wavURL: URL, cueURL: URL, pcm: Data) {
+    // /var → /private/var 符号链接：enumerator 返回已解析的真实路径，
+    // fixture 侧须一致 — resolvingSymlinksInPath() 对 /var 无效（实测），
+    // 用 realpath(3) 在建目录后解析
+    let rawDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pp_cue_\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: rawDir, withIntermediateDirectories: true)
+    let dir: URL
+    if let cPath = realpath(rawDir.path, nil) {
+        defer { free(cPath) }
+        dir = URL(fileURLWithPath: String(cString: cPath), isDirectory: true)
+    } else {
+        dir = rawDir
+    }
+    let wavURL = dir.appendingPathComponent("album.wav")
+    let wavData = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: frames)
+    try wavData.write(to: wavURL)
+    let cueURL = dir.appendingPathComponent("album.cue")
+    try cueBody.write(to: cueURL, atomically: true, encoding: .utf8)
+    return (dir, wavURL, cueURL, wavData.subdata(in: 44..<(44 + frames * 4)))
+}
+
+runTest("cueScannerExpandsVirtualTracks") {
+    let cue = """
+    PERFORMER "Test Artist"
+    TITLE "Test Album"
+    FILE "album.wav" WAVE
+      TRACK 01 AUDIO
+        TITLE "One"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Two"
+        PERFORMER "Other"
+        INDEX 01 00:00:30
+    """
+    let fixture = try makeCueFixture(frames: 44100, cueBody: cue)
+    defer { try? FileManager.default.removeItem(at: fixture.dir) }
+
+    let scanner = IncrementalScanner(databaseManager: DatabaseManager.shared)
+    let found = try scanner.fullScan(directory: fixture.dir)
+    // 整轨镜像被剔除，替换为 2 个虚拟轨
+    try assertEqual(found.count, 2)
+    try assertFalse(found.contains { $0.path == fixture.wavURL.path })
+    let decoded = found.compactMap { CueVirtualPath.decode($0.path) }
+    try assertEqual(decoded.count, 2)
+    try assertEqual(decoded.map { $0.trackNumber }, [1, 2])
+    try assertEqual(decoded[0].audioPath, fixture.wavURL.path)
+    try assertEqual(decoded[0].cuePath, fixture.cueURL.path)
+}
+
+runTest("cuePlaybackWindowIsBitExact") {
+    // 轨 1 = 0s..1s（0..44100 帧），轨 2 = 1s..2s（44100..88200 帧）
+    // 用整秒 INDEX（FF=0）避开 1/75 秒的浮点截断
+    let cue = """
+    PERFORMER "Test Artist"
+    TITLE "Test Album"
+    FILE "album.wav" WAVE
+      TRACK 01 AUDIO
+        TITLE "One"
+        INDEX 01 00:00:00
+      TRACK 02 AUDIO
+        TITLE "Two"
+        INDEX 01 00:01:00
+    """
+    let frames = 88200
+    let fixture = try makeCueFixture(frames: frames, cueBody: cue)
+    defer { try? FileManager.default.removeItem(at: fixture.dir) }
+
+    // 模拟 PlayerController.playLocal 的 CUE 解析路径
+    let encoded = CueVirtualPath.encode(audioPath: fixture.wavURL.path,
+                                        cuePath: fixture.cueURL.path,
+                                        trackNumber: 2)
+    guard let virt = CueVirtualPath.decode(encoded),
+          let loaded = CueLoader.load(cueURL: URL(fileURLWithPath: virt.cuePath)),
+          let t = loaded.sheet.tracks.first(where: { $0.number == virt.trackNumber }) else {
+        try assertTrue(false, "CUE 虚拟轨解析失败")
+        return
+    }
+    try assertEqual(t.startSeconds, 1.0)
+    try assertEqual(t.endSeconds, nil)   // 末轨到文件尾
+
+    let src = try LocalFileSource(url: loaded.audioURL)
+    let inner = try WAVDecoder(source: src)
+    let rate = inner.format.sampleRate
+    let trim = try TrimmingDecoder(inner: inner,
+                                   startFrame: Int64(t.startSeconds * rate),
+                                   endFrame: t.endSeconds.map { Int64($0 * rate) })
+    try assertEqual(trim.totalFrames, Int64(frames / 2))
+
+    // 全量解码窗口内容 → 与原始 PCM 后半段 bit-exact
+    var pcm = Data()
+    let chunk = 4096
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: chunk * 4, alignment: 16)
+    defer { buf.deallocate() }
+    while !trim.isAtEnd {
+        let n = try trim.decode(into: buf, maxFrames: chunk)
+        if n == 0 { break }
+        pcm.append(Data(bytes: buf, count: n * 4))
+    }
+    let expected = fixture.pcm.subdata(in: (frames / 2 * 4)..<(frames * 4))
+    try assertEqual(pcm, expected, "CUE 轨 2 窗口解码应与原始后半段一致")
+    trim.close()
+}
+#endif  // canImport(AudioToolbox)
+
 // ═══════════════════════════════════════════════════════
 // ALAC Factory Tests
 // ═══════════════════════════════════════════════════════
@@ -4214,6 +4342,116 @@ runTest("playerAppliesReplayGainFromFLACTag") {
     pc2.stop()
 }
 #endif
+
+// ═══════════════════════════════════════════════════════
+// LibFLAC Decoder Tests (issue #13) — 需 CFLAC 模块（build_libflac.sh）
+// + AudioToolbox（afconvert 生成真 FLAC 作为 ground truth）
+// ═══════════════════════════════════════════════════════
+#if canImport(AudioToolbox) && canImport(CFLAC)
+print("\n═══ LibFLAC Decoder Tests ═══")
+
+/// 用 afconvert 把 WAV 转成真 FLAC；返回 (flacURL, 原始 WAV PCM payload)。
+/// afconvert 对 <4608 帧输入产出 42 字节 stub，故调用方须传足够帧数。
+private func makeFLACFromPCM16(frames: Int) throws -> (URL, Data) {
+    let uid = UUID().uuidString
+    let tmp = FileManager.default.temporaryDirectory
+    let wavURL = tmp.appendingPathComponent("pp_lf_\(uid).wav")
+    let flacURL = tmp.appendingPathComponent("pp_lf_\(uid).flac")
+    let wavData = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: frames)
+    try wavData.write(to: wavURL)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+    proc.arguments = ["-f", "flac", "-d", "flac", wavURL.path, flacURL.path]
+    try proc.run()
+    proc.waitUntilExit()
+    let bytes = (try? Data(contentsOf: flacURL)) ?? Data()
+    guard proc.terminationStatus == 0, bytes.count > 4,
+          bytes[0] == 0x66, bytes[1] == 0x4C, bytes[2] == 0x61, bytes[3] == 0x43 else {
+        try? FileManager.default.removeItem(at: wavURL)
+        throw PurePlayError.decodeFailed("afconvert FLAC unavailable")
+    }
+    try? FileManager.default.removeItem(at: wavURL)
+    return (flacURL, wavData.subdata(in: 44..<(44 + frames * 4)))
+}
+
+runTest("libFLACDecoderBitExactNativeInt16") {
+    let frames = 8820
+    let (flacURL, originalPCM) = try makeFLACFromPCM16(frames: frames)
+    defer { try? FileManager.default.removeItem(at: flacURL) }
+
+    let src = try LocalFileSource(url: flacURL)
+    let dec = try LibFLACDecoder(source: src)
+    try assertEqual(dec.format.sampleRate, 44100.0)
+    try assertEqual(dec.format.channels, 2)
+    try assertEqual(dec.format.sampleFormat, .int16)   // 原生位深，非 float 容器
+    try assertEqual(dec.totalFrames, Int64(frames))
+
+    // 分块解码，累积 MD5，拼接 PCM
+    var pcm = Data()
+    let verifier = FLACMD5Verifier(bitsPerSample: 16, channels: 2)
+    let chunkFrames = 1024
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: chunkFrames * 4, alignment: 16)
+    defer { buf.deallocate() }
+    while !dec.isAtEnd {
+        let n = try dec.decode(into: buf, maxFrames: chunkFrames)
+        if n == 0 { break }
+        let slice = Data(bytes: buf, count: n * 4)
+        slice.withUnsafeBytes { verifier.updateRaw($0.baseAddress!, byteCount: n * 4) }
+        pcm.append(slice)
+    }
+    try assertEqual(dec.currentFrame, Int64(frames))
+    // 参考实现 bit-exact：解码 PCM 与原始 WAV payload 完全一致
+    try assertEqual(pcm, originalPCM, "libFLAC 16-bit 解码应 bit-identical 到 WAV payload")
+    // 且与 STREAMINFO MD5 匹配（ground truth 自证）
+    if let parsed = try? FLACMetadata.read(from: flacURL), parsed.streamInfo.hasMD5 {
+        let actual = verifier.finalize()
+        try assertEqual(actual, parsed.streamInfo.md5Signature,
+                        "libFLAC 解码样本 MD5 应匹配 STREAMINFO")
+    }
+    dec.close()
+}
+
+runTest("libFLACDecoderSeekAbsoluteWorks") {
+    // issue #13 回归：seek/tell/length/eof 回调旧实现传 nil → seek_absolute
+    // 永远 SEEK_UNSUPPORTED。补齐回调后中段 seek 必须成功并解出剩余帧。
+    let frames = 8820
+    let (flacURL, originalPCM) = try makeFLACFromPCM16(frames: frames)
+    defer { try? FileManager.default.removeItem(at: flacURL) }
+
+    let dec = try LibFLACDecoder(source: try LocalFileSource(url: flacURL))
+    let target: Int64 = 4410
+    try dec.seek(to: target)
+    try assertEqual(dec.currentFrame, target)
+
+    let remaining = frames - Int(target)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: remaining * 4, alignment: 16)
+    defer { buf.deallocate() }
+    var got = 0
+    while got < remaining {
+        let n = try dec.decode(into: buf.advanced(by: got * 4), maxFrames: remaining - got)
+        if n == 0 { break }
+        got += n
+    }
+    try assertEqual(got, remaining, "seek 后应解出剩余全部帧")
+    // seek 后解码内容应与原始 PCM 的后半段 bit-identical
+    let decodedTail = Data(bytes: buf, count: got * 4)
+    let expectedTail = originalPCM.subdata(in: (Int(target) * 4)..<(Int(target) * 4 + got * 4))
+    try assertEqual(decodedTail, expectedTail, "seek 后解码应与原始后半段一致")
+    dec.close()
+}
+
+runTest("libFLACFactoryOutranksCoreAudio") {
+    try assertGreaterThan(LibFLACDecoderFactory.priority, CoreAudioDecoderFactory.priority)
+    let frames = 8820
+    let (flacURL, _) = try makeFLACFromPCM16(frames: frames)
+    defer { try? FileManager.default.removeItem(at: flacURL) }
+    // 注册表解析 .flac 应命中 LibFLACDecoder（优先级 100 > 90）
+    let dec = try DecoderRegistry.shared.makeDecoder(
+        source: try LocalFileSource(url: flacURL), fileExtension: "flac")
+    try assertTrue(dec is LibFLACDecoder, "registry 应优先选 LibFLACDecoder")
+    dec.close()
+}
+#endif  // canImport(AudioToolbox) && canImport(CFLAC)
 
 // ═══════════════════════════════════════════════════════
 // Gapless & Schema Tests
