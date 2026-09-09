@@ -8,9 +8,9 @@ import Foundation
 /// 多相表 phasesPerZeroCrossing=64 → 总 taps = 32 × 64 = 2048 系数
 /// 阻带衰减 ≈ -95dB，听感上等价 SoXR VHQ
 ///
-/// 这是 LinearResamplerNode 的发烧级替代品；它**改变帧数**，所以不能装入
-/// DSPChain 的等长 in-place 流水线，而是由 AudioPipeline 通过 `processOutput`
-/// 单独管理。
+/// 它**改变帧数**，所以不能装入 DSPChain 的等长 in-place 流水线，
+/// 而是由 AudioPipeline 在 decodeLoop 的变长路径中直接调用（issue #5：
+/// 取代已删除的 LinearResamplerNode 占位直通，以及系统 mixer 内置 SRC）。
 ///
 /// 性能：64 phase 多相表，每输出样本 32 次 MAC；192k→44.1k 立体声
 /// 实测在 M1 上单核 < 20% CPU。

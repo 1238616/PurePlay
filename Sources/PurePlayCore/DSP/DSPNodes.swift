@@ -93,43 +93,10 @@ public final class GainNode: DSPNode {
     }
 }
 
-/// 极简线性插值重采样器（用于占位与测试，非发烧级）
-/// 真实产品应替换为 SoXR VHQ；本实现用于框架联调与 CI 测试
-public final class LinearResamplerNode: DSPNode {
-    public var isEnabled: Bool = true
-    public let name = "LinearResampler"
-
-    public let targetRate: Double
-    private var inputRate: Double = 0
-    private var channels: Int = 0
-    private var ratio: Double = 1
-    private var phase: Double = 0
-    private var lastSamples: [Float] = []
-
-    public init(targetRate: Double) {
-        self.targetRate = targetRate
-    }
-
-    public func configure(inputFormat: AudioFormat) -> AudioFormat {
-        self.inputRate = inputFormat.sampleRate
-        self.channels = inputFormat.channels
-        self.ratio = inputFormat.sampleRate / targetRate
-        self.lastSamples = Array(repeating: 0, count: inputFormat.channels)
-        return AudioFormat(sampleRate: targetRate,
-                           channels: inputFormat.channels,
-                           sampleFormat: .float32)
-    }
-
-    public func process(input: UnsafePointer<Float>,
-                        output: UnsafeMutablePointer<Float>,
-                        frameCount: Int) {
-        // 注意：本节点改变帧数，DSPChain.process 不能直接用于重采样
-        // 此处仅做 1:1 占位；实际重采样由 AudioPipeline 单独管线处理
-        for i in 0..<(frameCount * channels) {
-            output[i] = input[i]
-        }
-    }
-}
+// 注：LinearResamplerNode（1:1 直通占位符）已删除（issue #5）。
+// 它的 configure() 声称输出 targetRate 但 process() 只逐样本拷贝，
+// 会让 AudioPipeline 按错误采样率配置硬件 → 变速变调播放。
+// 重采样统一由 SincResampler 在 AudioPipeline 的变长路径中完成。
 
 /// Parametric EQ — up to 20 bands with user-configurable frequency, Q, gain, and filter type.
 /// Uses RBJ Audio EQ Cookbook biquad formulas (peaking, low shelf, high shelf).

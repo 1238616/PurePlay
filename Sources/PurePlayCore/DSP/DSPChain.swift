@@ -46,10 +46,9 @@ public final class DSPChain {
             nodes.append(GainNode(gainDB: preferences.replayGainDB))
         }
 
-        if let target = preferences.resamplerTargetRate,
-           target != inputFormat.sampleRate {
-            nodes.append(LinearResamplerNode(targetRate: target))
-        }
+        // issue #5：重采样不进 DSPChain — 它改变帧数，等长 in-place 接口装不下。
+        // 由 AudioPipeline 用 SincResampler 在独立的变长路径中处理
+        // preferences.resamplerTargetRate。
 
         if preferences.eqEnabled && !preferences.parametricBands.isEmpty {
             nodes.append(ParametricEQNode(bands: preferences.parametricBands,
@@ -95,6 +94,9 @@ public struct DSPPreferences: Sendable {
     public var replayGainEnabled: Bool = false
     public var replayGainDB: Float = 0
 
+    /// 目标重采样率（issue #5/#17：倍率上采样选项的基础）。
+    /// 由 AudioPipeline 经 SincResampler（-95dB Kaiser 多相）消费；
+    /// bit-perfect 或 DSD/DoP 路径下被忽略（重采样必然改变样本流）。
     public var resamplerTargetRate: Double? = nil
 
     public var eqEnabled: Bool = false

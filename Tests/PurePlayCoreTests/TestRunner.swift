@@ -927,6 +927,109 @@ runTest("pipelineFallsBackWhenRateUnsupported") {
     pipe.stop()
 }
 
+// --- issue #5: SincResampler 接线 ---
+
+runTest("pickTargetRatePrefersLowestUpsample") {
+    // 无精确匹配时选 ≥ source 的最低支持率（上采样对 DAC 滤波更从容）
+    let chosen = SampleRateManager.pickTargetRate(
+        source: 88200,
+        supported: [44100, 48000, 96000, 192000],
+        deviceDefault: 48000
+    )
+    try assertEqual(chosen, 96000.0)
+}
+
+runTest("pickTargetRateHighestWhenSourceExceedsAll") {
+    let chosen = SampleRateManager.pickTargetRate(
+        source: 384000,
+        supported: [44100, 48000, 96000],
+        deviceDefault: 44100
+    )
+    try assertEqual(chosen, 96000.0)
+}
+
+runTest("dspChainNoLongerClaimsResampledRate") {
+    // LinearResamplerNode 地雷已拆除：链输出率恒等于输入率
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    prefs.replayGainEnabled = true
+    prefs.resamplerTargetRate = 88200
+    let inFmt = AudioFormat(sampleRate: 44100, channels: 2, sampleFormat: .int16)
+    let chain = DSPChain.build(inputFormat: inFmt, preferences: prefs)
+    try assertEqual(chain.outputFormat.sampleRate, 44100.0)
+    try assertTrue(chain.nodes.allSatisfy { $0.name != "LinearResampler" })
+}
+
+runTest("pipelineSincResamplerDoublesRate") {
+    // 44.1k → 88.2k（×2 上采样）：输出格式、帧率与音调都必须正确
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    prefs.resamplerTargetRate = 88200
+    let dec = SineDecoder(sampleRate: 44100, channels: 1, durationSeconds: 1,
+                          frequency: 1000, amplitude: 0.5)
+    let out = MockAudioOutput()
+    let pipe = AudioPipeline(decoder: dec, output: out, dspPreferences: prefs)
+    try assertEqual(pipe.outputFormat.sampleRate, 88200.0)
+    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+    try assertTrue(pipe.resampler != nil)
+    try pipe.start()
+    Thread.sleep(forTimeInterval: 0.3)
+    // 读 17640 帧（0.2s @88.2k），1kHz 正弦应有 ~200 个正峰 —
+    // 若重采样是 1:1 直通地雷，峰数会只有 ~100（变速变调）
+    // 注意：必须在 stop() 之前读 — stop 会 reset ring buffer
+    let frames = 17640
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
+    let read = pipe.ringBuffer.read(into: buf, length: frames * 4)
+    pipe.stop()
+    defer { buf.deallocate() }
+    try assertEqual(read, frames * 4)
+    let fp = buf.assumingMemoryBound(to: Float.self)
+    var peaks = 0
+    for i in 1..<(frames - 1) {
+        if fp[i] > fp[i - 1] && fp[i] >= fp[i + 1] && fp[i] > 0.2 { peaks += 1 }
+    }
+    try assertGreaterThan(peaks, 175)
+    try assertLessThan(peaks, 225)
+    // 幅度保持（Kaiser sinc DC 归一 → 增益 ≈ 1）
+    var peakVal: Float = 0
+    for i in 0..<frames { peakVal = max(peakVal, abs(fp[i])) }
+    try assertEqualFloat(peakVal, 0.5, accuracy: 0.05)
+}
+
+runTest("pipelineResamplesWhenDeviceLacksSourceRate") {
+    // 设备不支持源率 → 主动接 SincResampler 到设备目标率，而非放任系统 SRC
+    let limitedDev = AudioDevice(
+        id: 98, name: "Limited DAC 2", uid: "limited-98",
+        maxSampleRate: 48000, supportedRates: [44100, 48000]
+    )
+    let out = MockAudioOutput()
+    try out.setDevice(limitedDev)
+    let decoder = SineDecoder(sampleRate: 96000, channels: 2, durationSeconds: 0.2)
+    let pipe = AudioPipeline(decoder: decoder, output: out)
+    try pipe.start()
+    try assertFalse(pipe.didMatchHardwareRate)
+    try assertTrue(pipe.resampler != nil)
+    try assertEqual(pipe.outputFormat.sampleRate, 48000.0)
+    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+    pipe.stop()
+}
+
+runTest("pipelineNeverResamplesDSD") {
+    // DoP 标记字节绝不允许经过重采样（issue #1/#5 边界）
+    let limitedDev = AudioDevice(
+        id: 97, name: "Limited DAC 3", uid: "limited-97",
+        maxSampleRate: 48000, supportedRates: [44100, 48000]
+    )
+    let out = MockAudioOutput()
+    try out.setDevice(limitedDev)
+    let dsd = DSFTestHelper.makeMinimalDSF()
+    let dec = try DSFDecoder(source: MemorySource(data: dsd))
+    let pipe = AudioPipeline(decoder: dec, output: out)
+    try pipe.start()
+    try assertTrue(pipe.resampler == nil)
+    pipe.stop()
+}
+
 runTest("hogPreferenceRoundTrip") {
     // Clean slate
     AudioPreferences.hogEnabled = false

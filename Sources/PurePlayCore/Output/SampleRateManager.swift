@@ -5,14 +5,20 @@ import Foundation
 public enum SampleRateManager {
 
     /// 在设备支持的采样率集合里挑一个最匹配 source 的目标率
-    /// 策略：
-    ///   1. 精确匹配优先
-    ///   2. 否则回退到 deviceDefault（用户决策：保证能出声）
+    /// 策略（issue #5 — AudioPipeline 会用 SincResampler 主动重采样到本目标，
+    /// 因此不再需要迁就系统 mixer SRC 而回退 deviceDefault）：
+    ///   1. 精确匹配优先（bit-perfect 直通）
+    ///   2. 否则取 ≥ source 的最低支持率（上采样：不丢失带宽，DAC 滤波更从容）
+    ///   3. 否则取最高支持率（source 超出设备能力时尽可能保带宽）
+    ///   4. supported 为空才回退 deviceDefault（保证能出声）
     public static func pickTargetRate(source: Double,
                                       supported: [Double],
                                       deviceDefault: Double) -> Double {
         if matches(source, in: supported) { return source }
-        return deviceDefault
+        guard !supported.isEmpty else { return deviceDefault }
+        let ascending = supported.sorted()
+        if let up = ascending.first(where: { $0 >= source }) { return up }
+        return ascending.last ?? deviceDefault
     }
 
     /// 切换硬件采样率，并轮询读取 NominalSampleRate 直到匹配或超时

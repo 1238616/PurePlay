@@ -11,7 +11,14 @@ public final class AudioPipeline {
     public let dspChain: DSPChain
     public let ringBuffer: PCMRingBuffer
     public let output: AudioOutputBackend
-    public let outputFormat: AudioFormat
+    /// 输出格式。init 时按 DSP/重采样偏好确定；start() 里若设备不支持
+    /// 该采样率，会接入 SincResampler 并更新为设备目标率（issue #5）
+    public private(set) var outputFormat: AudioFormat
+
+    /// 变长重采样器（issue #5）：非 nil 时 decodeLoop 走 float → SincResampler → ring 路径。
+    /// 来源：用户偏好 resamplerTargetRate，或 start() 时设备不支持源率的主动重采样。
+    /// DSD/DoP 永不重采样（会损毁标记字节）。
+    public private(set) var resampler: SincResampler?
 
     /// Optional spectrum analyzer that taps the decoded float buffer.
     public var spectrumAnalyzer: SpectrumAnalyzer?
@@ -69,9 +76,24 @@ public final class AudioPipeline {
         let chain = DSPChain.build(inputFormat: decoder.format, preferences: effectivePrefs)
         self.dspChain = chain
 
-        // 输出格式 = DSP 链输出；如果空链，则 = 解码器原始格式
+        // issue #5：用户偏好的重采样由 SincResampler 在变长路径处理。
+        // 仅非 bit-perfect、非 DSD 时启用 — 重采样必然改变样本流，
+        // 与 bit-perfect 语义互斥；DoP 重采样会损毁 0x05/0xFA 标记字节。
+        if !effectivePrefs.bitPerfect, !decoder.format.isDSD,
+           let target = effectivePrefs.resamplerTargetRate,
+           target > 0, abs(target - decoder.format.sampleRate) > 0.5 {
+            self.resampler = SincResampler(inputRate: decoder.format.sampleRate,
+                                           outputRate: target,
+                                           channels: decoder.format.channels)
+        }
+
+        // 输出格式 = 重采样目标率 > DSP 链输出 > 解码器原始格式
         let outFmt: AudioFormat
-        if chain.isBypass {
+        if let r = resampler {
+            outFmt = AudioFormat(sampleRate: r.outputRate,
+                                 channels: decoder.format.channels,
+                                 sampleFormat: .float32)
+        } else if chain.isBypass {
             outFmt = decoder.format
         } else {
             outFmt = AudioFormat(sampleRate: chain.outputFormat.sampleRate,
@@ -92,9 +114,6 @@ public final class AudioPipeline {
         guard !isRunning else { throw PurePlayError.alreadyPlaying }
         _isRunning.store(true, ordering: .releasing)
 
-        // 通知频谱分析器当前采样率，保持 bin→Hz 映射正确
-        spectrumAnalyzer?.setSampleRate(Float(decoder.format.sampleRate))
-
         // 切硬件采样率以匹配源文件（仅当用户选了具体设备）
         if let dev = output.currentDevice {
             let deviceCurrent = output.readNominalSampleRate()
@@ -104,6 +123,23 @@ public final class AudioPipeline {
                 supported: dev.supportedRates,
                 deviceDefault: fallback
             )
+            if abs(target - outputFormat.sampleRate) > 0.5 {
+                // issue #5：设备不支持当前输出率 — 主动接 SincResampler 重采样
+                // 到设备目标率（-95dB Kaiser 多相，优于系统 mixer 内置 SRC），
+                // 而非放任 CoreAudio 偷偷重采样。DSD/DoP 除外：重采样会损毁
+                // 0x05/0xFA 标记字节，此时保持旧行为（回退设备率，标记为未匹配）。
+                if !decoder.format.isDSD {
+                    resampler = SincResampler(inputRate: decoder.format.sampleRate,
+                                              outputRate: target,
+                                              channels: outputFormat.channels)
+                    outputFormat = AudioFormat(sampleRate: target,
+                                               channels: outputFormat.channels,
+                                               sampleFormat: .float32)
+                }
+                didMatchHardwareRate = false
+            } else {
+                didMatchHardwareRate = true
+            }
             // 构造 PhysicalFormat 目标格式（带原生位深，真正 bit-perfect）
             let physicalTarget = AudioFormat(
                 sampleRate: target,
@@ -120,10 +156,13 @@ public final class AudioPipeline {
                     didMatchHardwareRate = false
                 }
             }
-            didMatchHardwareRate = abs(target - outputFormat.sampleRate) < 0.5
         } else {
             didMatchHardwareRate = false
         }
+
+        // 通知频谱分析器当前采样率，保持 bin→Hz 映射正确
+        // （放在重采样决策之后 — 分析的是输出域样本）
+        spectrumAnalyzer?.setSampleRate(Float(outputFormat.sampleRate))
 
         // 启动解码线程
         let thread = Thread { [weak self] in
@@ -199,18 +238,28 @@ public final class AudioPipeline {
         let chunkFrames = 4096
         let decodeBytes = chunkFrames * decoderBPF
         let decodeBuffer = UnsafeMutableRawPointer.allocate(byteCount: decodeBytes, alignment: 16)
-        let needsConversion = !dspChain.isBypass && decoder.format.sampleFormat != .float32
+        // issue #5：float 路径 = DSP 链非 bypass 或 SincResampler 在线
+        let hasResampler = resampler != nil
+        let needsFloatPath = !dspChain.isBypass || hasResampler
+        let needsConversion = needsFloatPath && decoder.format.sampleFormat != .float32
         let floatSamples = chunkFrames * channels
         let floatBuffer = needsConversion
             ? UnsafeMutablePointer<Float>.allocate(capacity: floatSamples)
             : nil
-        let analyzerBuffer = (decoder.format.sampleFormat != .float32)
+        let analyzerBuffer = (!needsFloatPath && decoder.format.sampleFormat != .float32)
             ? UnsafeMutablePointer<Float>.allocate(capacity: floatSamples)
+            : nil
+        // 重采样输出缓冲（变长，按最坏比例估算容量）
+        let resampleCapacityFrames = hasResampler
+            ? resampler!.estimatedOutputFrames(forInputFrames: chunkFrames) : 0
+        let resampleBuffer = hasResampler
+            ? UnsafeMutablePointer<Float>.allocate(capacity: resampleCapacityFrames * channels)
             : nil
         defer {
             decodeBuffer.deallocate()
             floatBuffer?.deallocate()
             analyzerBuffer?.deallocate()
+            resampleBuffer?.deallocate()
         }
 
         while isRunning && !Thread.current.isCancelled {
@@ -243,7 +292,9 @@ public final class AudioPipeline {
                 continue
             }
 
-            let outputBytes = chunkFrames * outputBPF
+            // 背压按最坏输出帧数估算（重采样上变频时输出帧数 > 输入帧数）
+            let estOutFrames = hasResampler ? resampleCapacityFrames : chunkFrames
+            let outputBytes = estOutFrames * outputBPF
             if ringBuffer.availableToWrite < outputBytes {
                 Thread.sleep(forTimeInterval: 0.005)
                 continue
@@ -259,7 +310,8 @@ public final class AudioPipeline {
             }
             guard frames > 0 else { continue }
 
-            if dspChain.isBypass {
+            if !needsFloatPath {
+                // bit-perfect 直通：原始字节进 ring，不做任何处理（issue #1/#5 保证）
                 ringBuffer.write(decodeBuffer, length: frames * decoderBPF)
                 if decoder.format.sampleFormat == .float32 {
                     let fp = decodeBuffer.assumingMemoryBound(to: Float.self)
@@ -272,23 +324,37 @@ public final class AudioPipeline {
                     spectrumAnalyzer?.process(samples: ab, frameCount: frames, channels: channels)
                     waveformBuffer?.push(samples: ab, frameCount: frames, channels: channels)
                 }
-            } else if decoder.format.sampleFormat == .float32 {
-                let fp = decodeBuffer.assumingMemoryBound(to: Float.self)
-                dspChain.process(buffer: fp, frameCount: frames * channels)
-                applyVolume(fp, sampleCount: frames * channels)
-                ringBuffer.write(decodeBuffer, length: frames * outputBPF)
-                spectrumAnalyzer?.process(samples: fp, frameCount: frames, channels: channels)
-                waveformBuffer?.push(samples: fp, frameCount: frames, channels: channels)
+                continue
+            }
+
+            // float 域路径：[intToFloat] → DSP 链 → 音量 → [SincResampler] → ring
+            let work: UnsafeMutablePointer<Float>
+            if decoder.format.sampleFormat == .float32 {
+                work = decodeBuffer.assumingMemoryBound(to: Float.self)
             } else if let fb = floatBuffer {
-                let totalSamples = frames * channels
                 Self.intToFloat(src: decodeBuffer, dst: fb,
-                                sampleCount: totalSamples,
+                                sampleCount: frames * channels,
                                 sampleFormat: decoder.format.sampleFormat)
-                dspChain.process(buffer: fb, frameCount: totalSamples)
-                applyVolume(fb, sampleCount: totalSamples)
-                ringBuffer.write(fb, length: frames * outputBPF)
-                spectrumAnalyzer?.process(samples: fb, frameCount: frames, channels: channels)
-                waveformBuffer?.push(samples: fb, frameCount: frames, channels: channels)
+                work = fb
+            } else {
+                continue    // 理论不可达：needsFloatPath 时 floatBuffer 必已分配
+            }
+            dspChain.process(buffer: work, frameCount: frames * channels)
+            applyVolume(work, sampleCount: frames * channels)
+
+            if let r = resampler, let rb = resampleBuffer {
+                // issue #5：变长重采样（-95dB Kaiser 多相 sinc）
+                let outFrames = r.process(input: work, inputFrames: frames,
+                                          output: rb,
+                                          outputCapacityFrames: resampleCapacityFrames)
+                guard outFrames > 0 else { continue }
+                ringBuffer.write(rb, length: outFrames * channels * 4)
+                spectrumAnalyzer?.process(samples: rb, frameCount: outFrames, channels: channels)
+                waveformBuffer?.push(samples: rb, frameCount: outFrames, channels: channels)
+            } else {
+                ringBuffer.write(work, length: frames * outputBPF)
+                spectrumAnalyzer?.process(samples: work, frameCount: frames, channels: channels)
+                waveformBuffer?.push(samples: work, frameCount: frames, channels: channels)
             }
         }
     }
