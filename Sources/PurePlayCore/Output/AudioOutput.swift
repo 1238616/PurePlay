@@ -341,9 +341,14 @@ public final class CoreAudioHALOutput: AudioOutputBackend {
     }
 
     public func setVolume(_ volume: Float) {
-        guard let au = audioUnit else { return }
-        let clamped = max(0.0, min(1.0, volume))
-        AudioUnitSetParameter(au, kHALOutputParam_Volume, kAudioUnitScope_Global, 0, clamped, 0)
+        // 刻意不再设置 kHALOutputParam_Volume（issue #1）：
+        // 该参数是 HAL AudioUnit 内部的数字增益，位于我们的信号链之后 —
+        //   (a) 对样本做浮点乘法，直接破坏 bit-perfect；
+        //   (b) DoP 播放时损毁 24-bit 样本高位的 0x05/0xFA 交替标记字节，
+        //       DAC 检测不到 DoP 流会失锁并输出全幅强噪声。
+        // 音量统一由 AudioPipeline.setVolume(linearGain:) 在 DSP float 域处理；
+        // bit-perfect / DoP 路径音量恒为 unity，请通过功放 / DAC / 系统输出调节。
+        _ = volume
     }
 
     public func stop() {

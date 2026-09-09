@@ -3678,8 +3678,97 @@ runTest("stressVolumeAcrossTrackChange") {
     // Play second track — volume must persist
     try pc.playFromQueue(index: 1)
     Thread.sleep(forTimeInterval: 0.1)
-    try assertEqualFloat(out.currentVolume, 0.3, accuracy: 0.001)
+    // issue #1: HAL 数字增益 (kHALOutputParam_Volume) 不再被使用 —
+    // 输出后端音量恒为 unity，音量只存在于 DSP float 域
+    try assertEqualFloat(out.currentVolume, 1.0, accuracy: 0.0001)
+    // 滑杆位置跨曲目保留
+    try assertEqualFloat(pc.volume, 0.3, accuracy: 0.001)
     pc.stop()
+}
+
+// ═══════════════════════════════════════════════════════
+// Volume: bit-perfect 保护 (issue #1) + 感知 dB 曲线 (issue #17)
+// ═══════════════════════════════════════════════════════
+print("\n═══ Volume Curve / Bit-Perfect Volume Tests ═══")
+
+runTest("volumeCurveEndpoints") {
+    try assertEqualFloat(VolumeCurve.linearGain(slider: 1.0), 1.0, accuracy: 1e-6)
+    try assertEqualFloat(VolumeCurve.linearGain(slider: 0.0), 0.0, accuracy: 1e-6)
+    try assertEqualFloat(VolumeCurve.dB(slider: 1.0), 0.0, accuracy: 1e-6)
+    try assertTrue(VolumeCurve.dB(slider: 0.0) == -Float.infinity)
+}
+
+runTest("volumeCurveMidpointIsMinus30dB") {
+    try assertEqualFloat(VolumeCurve.dB(slider: 0.5), -30.0, accuracy: 1e-4)
+    try assertEqualFloat(VolumeCurve.linearGain(slider: 0.5), pow(10, -1.5), accuracy: 1e-5)
+}
+
+runTest("volumeCurveMonotonic") {
+    for i in 1...100 {
+        let hi = VolumeCurve.linearGain(slider: Float(i) / 100)
+        let lo = VolumeCurve.linearGain(slider: Float(i - 1) / 100)
+        try assertGreaterThan(hi, lo)
+    }
+}
+
+runTest("playerControllerVolumeBitPerfectStaysUnity") {
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)              // 默认 bitPerfect = true
+    pc.setVolume(0.3)
+    try assertEqualFloat(pc.effectiveVolumeGain, 1.0, accuracy: 0)
+
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    let pc2 = PlayerController(output: out, dspPreferences: prefs)
+    pc2.setVolume(0.5)
+    try assertEqualFloat(pc2.effectiveVolumeGain,
+                         VolumeCurve.linearGain(slider: 0.5), accuracy: 1e-6)
+}
+
+runTest("pipelineAppliesVolumeInDSPDomain") {
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    prefs.replayGainEnabled = true
+    prefs.replayGainDB = 0            // 链非空 → float32 DSP 路径
+    let dec = SineDecoder(sampleRate: 44100, channels: 1, durationSeconds: 1,
+                          frequency: 1000, amplitude: 0.5)
+    let out = MockAudioOutput()
+    let pipe = AudioPipeline(decoder: dec, output: out, dspPreferences: prefs)
+    pipe.setVolume(linearGain: 0.5)
+    try pipe.start()
+    Thread.sleep(forTimeInterval: 0.25)
+    let frames = 1024
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let read = pipe.ringBuffer.read(into: buf, length: frames * 4)
+    try assertEqual(read, frames * 4)
+    let fp = buf.assumingMemoryBound(to: Float.self)
+    var peak: Float = 0
+    for i in 0..<frames { peak = max(peak, abs(fp[i])) }
+    // 0.5 振幅 × 0.5 增益 = 0.25 — 音量确实作用在 DSP float 域
+    try assertEqualFloat(peak, 0.25, accuracy: 0.02)
+    pipe.stop()
+}
+
+runTest("pipelineBitPerfectIgnoresVolume") {
+    let frames = 2048
+    let wav = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: frames)
+    let source = MemorySource(data: wav)
+    let dec = try WAVDecoder(source: source)
+    let out = MockAudioOutput()
+    let pipe = AudioPipeline(decoder: dec, output: out)   // 默认 bitPerfect → 空链
+    pipe.setVolume(linearGain: 0.5)                        // 必须不生效
+    try pipe.start()
+    Thread.sleep(forTimeInterval: 0.25)
+    let byteCount = frames * 4
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
+    defer { buf.deallocate() }
+    let read = pipe.ringBuffer.read(into: buf, length: byteCount)
+    try assertEqual(read, byteCount)
+    let original = wav.subdata(in: 44..<(44 + byteCount))
+    try assertEqual(Data(bytes: buf, count: byteCount), original,
+                    "bit-perfect 路径不得应用任何增益（DoP 标记字节依赖此保证）")
+    pipe.stop()
 }
 
 // ═══════════════════════════════════════════════════════

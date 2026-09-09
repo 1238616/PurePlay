@@ -29,6 +29,24 @@ public final class AudioPipeline {
     /// 保护 decoder.seek / decoder.decode 互斥；ring buffer reset 也在锁内执行
     private let seekLock = NSLock()
 
+    /// 软件音量（线性增益）— 仅在 DSP float 路径 (!dspChain.isBypass) 生效。
+    /// bit-perfect / DoP（整数直通）路径**永不**应用增益：
+    /// 任何乘法都会破坏 bit-perfect；DoP 时还会损毁 24-bit 样本高位的
+    /// 0x05/0xFA 标记字节，导致 DAC 失锁输出强噪声（issue #1）。
+    private let _volumeGainBits = ManagedAtomic<UInt32>(Float(1.0).bitPattern)
+
+    /// 当前软件音量线性增益（1.0 = unity）
+    public var volumeGain: Float {
+        Float(bitPattern: _volumeGainBits.load(ordering: .acquiring))
+    }
+
+    /// 设置软件音量（线性增益，clamp 到 0...4）。
+    /// 仅当 DSP 链非 bypass 时被 decodeLoop 应用；bit-perfect 路径固定 unity。
+    public func setVolume(linearGain gain: Float) {
+        let clamped = max(0, min(4.0, gain))
+        _volumeGainBits.store(clamped.bitPattern, ordering: .releasing)
+    }
+
     /// 便捷初始化：给定解码器和配置，自动构建管线
     public init(decoder: AudioDecoder,
                 output: AudioOutputBackend,
@@ -257,6 +275,7 @@ public final class AudioPipeline {
             } else if decoder.format.sampleFormat == .float32 {
                 let fp = decodeBuffer.assumingMemoryBound(to: Float.self)
                 dspChain.process(buffer: fp, frameCount: frames * channels)
+                applyVolume(fp, sampleCount: frames * channels)
                 ringBuffer.write(decodeBuffer, length: frames * outputBPF)
                 spectrumAnalyzer?.process(samples: fp, frameCount: frames, channels: channels)
                 waveformBuffer?.push(samples: fp, frameCount: frames, channels: channels)
@@ -266,11 +285,20 @@ public final class AudioPipeline {
                                 sampleCount: totalSamples,
                                 sampleFormat: decoder.format.sampleFormat)
                 dspChain.process(buffer: fb, frameCount: totalSamples)
+                applyVolume(fb, sampleCount: totalSamples)
                 ringBuffer.write(fb, length: frames * outputBPF)
                 spectrumAnalyzer?.process(samples: fb, frameCount: frames, channels: channels)
                 waveformBuffer?.push(samples: fb, frameCount: frames, channels: channels)
             }
         }
+    }
+
+    /// 在 float 域应用软件音量（仅非 bypass 的 DSP 路径调用）。
+    /// unity 增益时零开销直通。
+    private func applyVolume(_ buf: UnsafeMutablePointer<Float>, sampleCount: Int) {
+        let g = Float(bitPattern: _volumeGainBits.load(ordering: .acquiring))
+        guard g != 1.0 else { return }
+        for i in 0..<sampleCount { buf[i] *= g }
     }
 
     private static func intToFloat(src: UnsafeRawPointer, dst: UnsafeMutablePointer<Float>,

@@ -221,7 +221,7 @@ public final class PlayerController: @unchecked Sendable {
         self.pipeline = pipe
         acquireHogIfNeeded()
         try pipe.start()
-        output.setVolume(volume)
+        applyVolumeToPipeline()
         state = .playing
         startEndDetection()
     }
@@ -243,7 +243,7 @@ public final class PlayerController: @unchecked Sendable {
         self.pipeline = pipe
         acquireHogIfNeeded()
         try pipe.start()
-        output.setVolume(volume)
+        applyVolumeToPipeline()
         state = .playing
         startEndDetection()
     }
@@ -323,9 +323,26 @@ public final class PlayerController: @unchecked Sendable {
         }
     }
 
+    /// 设置音量（滑杆位置 0...1）。
+    /// 实际增益经 VolumeCurve 感知 dB 映射（issue #17），
+    /// 并只应用在 DSP float 域 — 见 applyVolumeToPipeline（issue #1）。
     public func setVolume(_ newVolume: Float) {
         volume = max(0.0, min(1.0, newVolume))
-        output.setVolume(volume)
+        applyVolumeToPipeline()
+    }
+
+    /// 当前生效的线性增益（bit-perfect 下恒为 1.0）
+    public var effectiveVolumeGain: Float {
+        dspPreferences.bitPerfect ? 1.0 : VolumeCurve.linearGain(slider: volume)
+    }
+
+    /// 把音量应用到当前管线的 DSP float 域。
+    /// bit-perfect 模式下音量固定 unity — HAL 数字增益会破坏 bit-perfect，
+    /// 且 DoP 时会损毁 0x05/0xFA 标记字节导致 DAC 失锁（issue #1）；
+    /// 用户应通过功放 / DAC / 系统输出调节音量。
+    private func applyVolumeToPipeline() {
+        guard let pipe = pipeline else { return }
+        pipe.setVolume(linearGain: effectiveVolumeGain)
     }
 
     public func next() throws {
