@@ -89,6 +89,162 @@ public enum WAVTestHelper {
     }
 }
 
+extension WAVTestHelper {
+
+    /// WAVE_FORMAT_EXTENSIBLE + IEEE Float SubFormat GUID（32-bit float 立体声）
+    /// 专业录音设备的常见封装 — 回归 issue #3：不得被误判为 int32
+    public static func makeExtensibleFloat32Stereo(sampleRate: Int = 48000,
+                                                   durationFrames: Int = 480) -> Data {
+        let channels = 2
+        let dataSize = durationFrames * channels * 4
+
+        var data = Data()
+        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46])          // "RIFF"
+        data.appendLE32(UInt32(4 + (8 + 40) + (8 + dataSize)))
+        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45])          // "WAVE"
+
+        data.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])          // "fmt "
+        data.appendLE32(40)                                         // extensible fmt size
+        data.appendLE16(0xFFFE)                                     // WAVE_FORMAT_EXTENSIBLE
+        data.appendLE16(UInt16(channels))
+        data.appendLE32(UInt32(sampleRate))
+        data.appendLE32(UInt32(sampleRate * channels * 4))
+        data.appendLE16(UInt16(channels * 4))                       // block align
+        data.appendLE16(32)                                         // bits
+        data.appendLE16(22)                                         // cbSize
+        data.appendLE16(32)                                         // valid bits
+        data.appendLE32(3)                                          // channel mask (FL|FR)
+        // SubFormat GUID = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        // {00000003-0000-0010-8000-00aa00389b71}
+        data.appendLE32(0x0003)
+        data.appendLE16(0x0000)
+        data.appendLE16(0x0010)
+        data.append(contentsOf: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+
+        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61])          // "data"
+        data.appendLE32(UInt32(dataSize))
+        for i in 0..<durationFrames {
+            let t = 2.0 * Double.pi * 440.0 * Double(i) / Double(sampleRate)
+            let f = Float(sin(t) * 0.5)
+            for _ in 0..<channels { data.appendLE32(f.bitPattern) }
+        }
+        return data
+    }
+
+    /// WAVE_FORMAT_EXTENSIBLE + PCM SubFormat GUID（24-bit 立体声）
+    public static func makeExtensiblePCM24Stereo(sampleRate: Int = 96000,
+                                                 durationFrames: Int = 960) -> Data {
+        let channels = 2
+        let dataSize = durationFrames * channels * 3
+
+        var data = Data()
+        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
+        data.appendLE32(UInt32(4 + (8 + 40) + (8 + dataSize)))
+        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45])
+
+        data.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])
+        data.appendLE32(40)
+        data.appendLE16(0xFFFE)
+        data.appendLE16(UInt16(channels))
+        data.appendLE32(UInt32(sampleRate))
+        data.appendLE32(UInt32(sampleRate * channels * 3))
+        data.appendLE16(UInt16(channels * 3))
+        data.appendLE16(24)
+        data.appendLE16(22)
+        data.appendLE16(24)
+        data.appendLE32(3)
+        // SubFormat GUID = KSDATAFORMAT_SUBTYPE_PCM {00000001-...}
+        data.appendLE32(0x0001)
+        data.appendLE16(0x0000)
+        data.appendLE16(0x0010)
+        data.append(contentsOf: [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+
+        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
+        data.appendLE32(UInt32(dataSize))
+        for i in 0..<durationFrames {
+            let t = 2.0 * Double.pi * 1000.0 * Double(i) / Double(sampleRate)
+            let s32 = Int32(sin(t) * 4_000_000)
+            for _ in 0..<channels {
+                data.append(UInt8(truncatingIfNeeded: s32 & 0xFF))
+                data.append(UInt8(truncatingIfNeeded: (s32 >> 8) & 0xFF))
+                data.append(UInt8(truncatingIfNeeded: (s32 >> 16) & 0xFF))
+            }
+        }
+        return data
+    }
+
+    /// IEEE Float 64-bit WAV（tag=3, bits=64）— 解码侧应降转 float32
+    public static func makeFloat64Mono(sampleRate: Int = 44100,
+                                       durationFrames: Int = 441) -> Data {
+        let dataSize = durationFrames * 8
+
+        var data = Data()
+        data.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
+        data.appendLE32(UInt32(4 + (8 + 18) + (8 + dataSize)))
+        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45])
+
+        data.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])
+        data.appendLE32(18)
+        data.appendLE16(3)                                          // IEEE Float
+        data.appendLE16(1)                                          // mono
+        data.appendLE32(UInt32(sampleRate))
+        data.appendLE32(UInt32(sampleRate * 8))
+        data.appendLE16(8)                                          // block align
+        data.appendLE16(64)
+        data.appendLE16(0)                                          // cbSize（18 字节 fmt）
+
+        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
+        data.appendLE32(UInt32(dataSize))
+        for i in 0..<durationFrames {
+            let t = 2.0 * Double.pi * 440.0 * Double(i) / Double(sampleRate)
+            let v = sin(t) * 0.5
+            var d = v
+            withUnsafeBytes(of: &d) { data.append(contentsOf: $0) }
+        }
+        return data
+    }
+
+    /// RF64 封装的 PCM16：data chunk size 为占位符 0xFFFFFFFF，
+    /// 真实尺寸只在 ds64 chunk（issue #4）。实际数据仍是小体量。
+    public static func makeRF64PCM16(sampleRate: Int = 44100,
+                                     durationFrames: Int = 100,
+                                     declaredDataSize: UInt64) -> Data {
+        let channels = 2
+
+        var data = Data()
+        data.append(contentsOf: [0x52, 0x46, 0x36, 0x34])          // "RF64"
+        data.appendLE32(0xFFFFFFFF)                                 // 占位 riff size
+        data.append(contentsOf: [0x57, 0x41, 0x56, 0x45])          // "WAVE"
+
+        // ds64 chunk（必须是第一个 chunk）
+        data.append(contentsOf: [0x64, 0x73, 0x36, 0x34])          // "ds64"
+        data.appendLE32(28)
+        data.appendLE64(0xFFFF_FFFF_FFFF)                           // riffSize (64-bit)
+        data.appendLE64(declaredDataSize)                           // dataSize (64-bit)
+        data.appendLE64(declaredDataSize / UInt64(channels * 2))    // sampleCount
+        data.appendLE32(0)                                          // tableLength
+
+        data.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])
+        data.appendLE32(16)
+        data.appendLE16(1)
+        data.appendLE16(UInt16(channels))
+        data.appendLE32(UInt32(sampleRate))
+        data.appendLE32(UInt32(sampleRate * channels * 2))
+        data.appendLE16(UInt16(channels * 2))
+        data.appendLE16(16)
+
+        data.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
+        data.appendLE32(0xFFFFFFFF)                                 // 占位 data size
+        for i in 0..<durationFrames {
+            let t = 2.0 * Double.pi * 440.0 * Double(i) / Double(sampleRate)
+            let sample = Int16(sin(t) * 16000)
+            data.appendLE16(UInt16(bitPattern: sample))
+            data.appendLE16(UInt16(bitPattern: sample))
+        }
+        return data
+    }
+}
+
 extension Data {
     mutating func appendLE16(_ val: UInt16) {
         append(UInt8(val & 0xFF))

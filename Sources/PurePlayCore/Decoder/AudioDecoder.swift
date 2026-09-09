@@ -58,11 +58,24 @@ public final class DecoderRegistry {
 
     public func makeDecoder(source: AudioSource, fileExtension: String) throws -> AudioDecoder {
         let ext = fileExtension.lowercased()
+        var lastError: Error?
         for factory in factories {
             if factory.supportedExtensions.contains(ext) &&
                factory.canDecode(source: source, fileExtension: ext) {
-                return try factory.makeDecoder(source: source, fileExtension: ext)
+                do {
+                    return try factory.makeDecoder(source: source, fileExtension: ext)
+                } catch {
+                    // 扩展名匹配的工厂不保证能真正解码该文件
+                    // （例：.ogg 可能是 Vorbis——ExtAudioFile 解不了，需级联到 FFmpeg）。
+                    // 记录错误，把 source 复位后继续尝试下一优先级工厂。
+                    lastError = error
+                    try? source.seek(to: 0)
+                    continue
+                }
             }
+        }
+        if let lastError {
+            throw lastError
         }
         throw PurePlayError.unsupportedFormat(ext)
     }

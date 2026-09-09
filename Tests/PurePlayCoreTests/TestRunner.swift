@@ -273,6 +273,98 @@ runTest("invalidHeader") {
     try assertThrows(try WAVDecoder(source: source))
 }
 
+// --- issue #3: WAVE_FORMAT_EXTENSIBLE SubFormat GUID ---
+
+runTest("wavExtensibleFloat32DetectedAsFloat") {
+    let wavData = WAVTestHelper.makeExtensibleFloat32Stereo(sampleRate: 48000, durationFrames: 480)
+    let source = MemorySource(data: wavData)
+    let decoder = try WAVDecoder(source: source)
+    try assertEqual(decoder.format.sampleFormat, .float32)
+    try assertEqual(decoder.format.channels, 2)
+    try assertEqual(decoder.totalFrames, 480)
+
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 480 * 8, alignment: 16)
+    defer { buf.deallocate() }
+    let frames = try decoder.decode(into: buf, maxFrames: 480)
+    try assertEqual(frames, 480)
+    let fp = buf.assumingMemoryBound(to: Float.self)
+    // 首样本 sin(0)=0
+    try assertEqualFloat(fp[0], 0.0, accuracy: 1e-6)
+    // 峰值应接近 0.5（float 数据被正确解读，而非 int32 垃圾值）
+    var peak: Float = 0
+    for i in 0..<(480 * 2) { peak = max(peak, abs(fp[i])) }
+    try assertEqualFloat(peak, 0.5, accuracy: 0.01)
+}
+
+runTest("wavExtensiblePCM24DetectedAsInt24") {
+    let wavData = WAVTestHelper.makeExtensiblePCM24Stereo(sampleRate: 96000, durationFrames: 960)
+    let source = MemorySource(data: wavData)
+    let decoder = try WAVDecoder(source: source)
+    try assertEqual(decoder.format.sampleFormat, .int24)
+    try assertEqual(decoder.format.sampleRate, 96000.0)
+    try assertEqual(decoder.totalFrames, 960)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 960 * 6, alignment: 16)
+    defer { buf.deallocate() }
+    let frames = try decoder.decode(into: buf, maxFrames: 960)
+    try assertEqual(frames, 960)
+}
+
+runTest("wavExtensibleUnknownGUIDThrows") {
+    // 取 PCM24 生成器，把 SubFormat GUID Data1（文件偏移 44）改成 0x0002（ADPCM）
+    var wavData = WAVTestHelper.makeExtensiblePCM24Stereo()
+    wavData[44] = 0x02; wavData[45] = 0x00; wavData[46] = 0x00; wavData[47] = 0x00
+    let source = MemorySource(data: wavData)
+    try assertThrows(try WAVDecoder(source: source))
+}
+
+// --- issue #3: IEEE Float 64-bit 降转 float32 ---
+
+runTest("wavFloat64DownconvertsToFloat32") {
+    let wavData = WAVTestHelper.makeFloat64Mono(sampleRate: 44100, durationFrames: 441)
+    let source = MemorySource(data: wavData)
+    let decoder = try WAVDecoder(source: source)
+    try assertEqual(decoder.format.sampleFormat, .float32)
+    try assertEqual(decoder.format.channels, 1)
+    try assertEqual(decoder.totalFrames, 441)
+
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 441 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let frames = try decoder.decode(into: buf, maxFrames: 441)
+    try assertEqual(frames, 441)
+    let fp = buf.assumingMemoryBound(to: Float.self)
+    // 校验若干样本与 sin(t)*0.5 一致（Double→Float 降转）
+    for i in [0, 100, 220, 440] {
+        let t = 2.0 * Double.pi * 440.0 * Double(i) / 44100.0
+        try assertEqualFloat(fp[i], Float(sin(t) * 0.5), accuracy: 1e-6)
+    }
+    // seek 使用 diskBytesPerFrame(8)：回到 200 帧再解码应得到对应样本
+    try decoder.seek(to: 200)
+    let f2 = try decoder.decode(into: buf, maxFrames: 241)
+    try assertEqual(f2, 241)
+    let t200 = 2.0 * Double.pi * 440.0 * 200.0 / 44100.0
+    try assertEqualFloat(fp[0], Float(sin(t200) * 0.5), accuracy: 1e-6)
+}
+
+// --- issue #4: RF64 / ds64 ---
+
+runTest("wavRF64UsesDs64DataSize") {
+    let frames = 100
+    let declared = UInt64(frames * 2 * 2)   // 与实际数据一致
+    let wavData = WAVTestHelper.makeRF64PCM16(sampleRate: 44100,
+                                              durationFrames: frames,
+                                              declaredDataSize: declared)
+    let source = MemorySource(data: wavData)
+    let decoder = try WAVDecoder(source: source)
+    try assertEqual(decoder.format.sampleFormat, .int16)
+    // data chunk size 是占位符 0xFFFFFFFF — totalFrames 必须来自 ds64
+    try assertEqual(decoder.totalFrames, Int64(frames))
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let decoded = try decoder.decode(into: buf, maxFrames: frames)
+    try assertEqual(decoded, frames)
+    try assertTrue(decoder.isAtEnd)
+}
+
 // ═══════════════════════════════════════════════════════
 // Sine Decoder Tests
 // ═══════════════════════════════════════════════════════
@@ -325,6 +417,68 @@ runTest("decoderRegistry") {
 runTest("registryUnsupported") {
     let src = MemorySource(data: Data())
     try assertThrows(try DecoderRegistry.shared.makeDecoder(source: src, fileExtension: "xyz"))
+}
+
+// --- issue #2: 工厂失败后级联降级到下一优先级工厂 ---
+
+enum QTestFailHighFactory: DecoderFactory {
+    static let supportedExtensions: Set<String> = ["qtest"]
+    static let priority: Int = 200
+    static func canDecode(source: AudioSource, fileExtension: String) -> Bool { true }
+    static func makeDecoder(source: AudioSource, fileExtension: String) throws -> AudioDecoder {
+        throw PurePlayError.decodeFailed("qtest-high: intentional failure")
+    }
+}
+
+enum QTestSineLowFactory: DecoderFactory {
+    static let supportedExtensions: Set<String> = ["qtest"]
+    static let priority: Int = 50
+    static func canDecode(source: AudioSource, fileExtension: String) -> Bool { true }
+    static func makeDecoder(source: AudioSource, fileExtension: String) throws -> AudioDecoder {
+        SineDecoder(durationSeconds: 0.01)
+    }
+}
+
+enum QTestAllFailHighFactory: DecoderFactory {
+    static let supportedExtensions: Set<String> = ["qfail"]
+    static let priority: Int = 200
+    static func canDecode(source: AudioSource, fileExtension: String) -> Bool { true }
+    static func makeDecoder(source: AudioSource, fileExtension: String) throws -> AudioDecoder {
+        throw PurePlayError.decodeFailed("qfail-high")
+    }
+}
+
+enum QTestAllFailLowFactory: DecoderFactory {
+    static let supportedExtensions: Set<String> = ["qfail"]
+    static let priority: Int = 100
+    static func canDecode(source: AudioSource, fileExtension: String) -> Bool { true }
+    static func makeDecoder(source: AudioSource, fileExtension: String) throws -> AudioDecoder {
+        throw PurePlayError.decodeFailed("qfail-low")
+    }
+}
+
+runTest("registryFallsBackWhenFactoryFails") {
+    let registry = DecoderRegistry.shared
+    registry.register(QTestFailHighFactory.self)
+    registry.register(QTestSineLowFactory.self)
+    let src = MemorySource(data: Data())
+    let dec = try registry.makeDecoder(source: src, fileExtension: "qtest")
+    try assertTrue(dec is SineDecoder,
+                   "高优先级工厂失败后应级联到低优先级 SineDecoder 工厂")
+}
+
+runTest("registryThrowsLastErrorWhenAllFail") {
+    let registry = DecoderRegistry.shared
+    registry.register(QTestAllFailHighFactory.self)
+    registry.register(QTestAllFailLowFactory.self)
+    let src = MemorySource(data: Data())
+    do {
+        _ = try registry.makeDecoder(source: src, fileExtension: "qfail")
+        try assertTrue(false, "expected throw")
+    } catch let e as PurePlayError {
+        // 全部失败时应抛出最后一次（最低优先级）工厂的错误，而非 unsupportedFormat
+        try assertEqual(e, PurePlayError.decodeFailed("qfail-low"))
+    }
 }
 
 // ═══════════════════════════════════════════════════════

@@ -11,6 +11,12 @@ public final class WAVDecoder: AudioDecoder {
     private let source: AudioSource
     private let dataChunkOffset: Int64
     private let dataChunkLength: Int64
+    /// 源数据为 64-bit float — 磁盘 8B/样本，decode 输出降转为 float32
+    private let sourceIsFloat64: Bool
+    /// 磁盘上每帧字节数（float64 源 = channels×8，其余与 format.bytesPerFrame 相同）
+    private let diskBytesPerFrame: Int
+    /// float64 解码复用的 scratch（避免每帧分配）
+    private var f64Scratch: [UInt8] = []
 
     public var isAtEnd: Bool { currentFrame >= totalFrames }
 
@@ -43,6 +49,10 @@ public final class WAVDecoder: AudioDecoder {
         var formatTag: UInt16 = 0
         var dataOffset: Int64 = 0
         var dataLength: Int64 = 0
+        /// EXTENSIBLE SubFormat GUID 的 Data1（0x0001 = PCM, 0x0003 = IEEE Float）
+        var subFormatCode: UInt32 = 0
+        /// RF64 ds64 chunk 提供的 64-bit data 尺寸
+        var ds64DataSize: Int64? = nil
 
         // 当前位置 = 12（RIFF header 之后）
         var cursor: Int64 = 12
@@ -73,8 +83,33 @@ public final class WAVDecoder: AudioDecoder {
                             (UInt32(fmtData[6]) << 16) | (UInt32(fmtData[7]) << 24)
                 sampleRate = Double(sr)
                 bitsPerSample = Int(UInt16(fmtData[14]) | (UInt16(fmtData[15]) << 8))
+                // WAVE_FORMAT_EXTENSIBLE：SubFormat GUID 位于 fmt 数据偏移 24
+                // 专业录音设备的 32-bit float WAV 常用 EXTENSIBLE 封装，
+                // 仅看 bitsPerSample 会把 float 误判为整数（issue #3）
+                if formatTag == 0xFFFE && size >= 28 {
+                    subFormatCode = UInt32(fmtData[24]) | (UInt32(fmtData[25]) << 8) |
+                                    (UInt32(fmtData[26]) << 16) | (UInt32(fmtData[27]) << 24)
+                }
                 fmtFound = true
-                cursor += Int64(size)
+                let fmtPad = size & 1   // RIFF chunk 偶字节对齐
+                if fmtPad != 0 { try source.seek(to: cursor + Int64(size + fmtPad)) }
+                cursor += Int64(size + fmtPad)
+            } else if id == "ds64" {
+                // RF64：真实 64-bit 尺寸在 ds64 chunk（riffSize/dataSize/sampleCount，各 LE64）
+                // data chunk 的 32-bit size 字段此时是占位符 0xFFFFFFFF（issue #4）
+                let bodyLen = max(size, 24)
+                var body = [UInt8](repeating: 0, count: bodyLen)
+                let r = try body.withUnsafeMutableBufferPointer {
+                    try source.read(into: $0.baseAddress!, length: size)
+                }
+                if r >= 24 {
+                    var v: UInt64 = 0
+                    for i in 0..<8 { v |= UInt64(body[8 + i]) << (8 * i) }
+                    ds64DataSize = Int64(bitPattern: v)
+                }
+                let pad = size & 1
+                try source.seek(to: cursor + Int64(size + pad))
+                cursor += Int64(size + pad)
             } else if id == "data" {
                 dataOffset = cursor
                 dataLength = Int64(size)
@@ -99,27 +134,54 @@ public final class WAVDecoder: AudioDecoder {
             throw PurePlayError.invalidWAVHeader("Missing fmt or data chunk")
         }
 
-        // formatTag: 1=PCM, 3=IEEE Float, 0xFFFE=WAVE_FORMAT_EXTENSIBLE
-        let sampleFormat: SampleFormat
-        switch (formatTag, bitsPerSample) {
-        case (1, 16): sampleFormat = .int16
-        case (1, 24): sampleFormat = .int24
-        case (1, 32): sampleFormat = .int32
-        case (3, 32): sampleFormat = .float32
-        case (0xFFFE, 16): sampleFormat = .int16
-        case (0xFFFE, 24): sampleFormat = .int24
-        case (0xFFFE, 32): sampleFormat = .int32
-        default:
-            throw PurePlayError.invalidWAVHeader("Unsupported PCM format tag=\(formatTag) bits=\(bitsPerSample)")
+        // RF64：data chunk 的 32-bit size 是占位符 0xFFFFFFFF，真实尺寸取自 ds64（issue #4）
+        if riff == "RF64", let real = ds64DataSize {
+            dataLength = real
+        } else if dataLength == 0xFFFFFFFF, let real = ds64DataSize {
+            dataLength = real
         }
+
+        // formatTag: 1=PCM, 3=IEEE Float, 0xFFFE=WAVE_FORMAT_EXTENSIBLE
+        // EXTENSIBLE 的真实格式由 SubFormat GUID Data1 决定：
+        //   0x0001 = KSDATAFORMAT_SUBTYPE_PCM, 0x0003 = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        let isFloat: Bool
+        switch formatTag {
+        case 1:
+            isFloat = false
+        case 3:
+            isFloat = true
+        case 0xFFFE:
+            guard subFormatCode == 0x0001 || subFormatCode == 0x0003 else {
+                throw PurePlayError.invalidWAVHeader(
+                    "Unsupported EXTENSIBLE SubFormat GUID code=0x\(String(subFormatCode, radix: 16))")
+            }
+            isFloat = (subFormatCode == 0x0003)
+        default:
+            throw PurePlayError.invalidWAVHeader("Unsupported format tag=\(formatTag)")
+        }
+
+        let sampleFormat: SampleFormat
+        switch (isFloat, bitsPerSample) {
+        case (false, 16): sampleFormat = .int16
+        case (false, 24): sampleFormat = .int24
+        case (false, 32): sampleFormat = .int32
+        case (true, 32):  sampleFormat = .float32
+        case (true, 64):  sampleFormat = .float32   // 64-bit float 解码侧降为 float32
+        default:
+            throw PurePlayError.invalidWAVHeader("Unsupported PCM format float=\(isFloat) bits=\(bitsPerSample)")
+        }
+        let isFloat64Source = isFloat && bitsPerSample == 64
 
         self.format = AudioFormat(sampleRate: sampleRate,
                                   channels: channels,
                                   sampleFormat: sampleFormat)
+        self.sourceIsFloat64 = isFloat64Source
+        // 磁盘上每帧字节数：float64 源为 8B/样本，其余与输出格式一致
+        self.diskBytesPerFrame = channels * (isFloat64Source ? 8 : sampleFormat.bytesPerSample)
         self.dataChunkOffset = dataOffset
         self.dataChunkLength = dataLength
-        let bytesPerFrame = Int64(channels * sampleFormat.bytesPerSample)
-        self.totalFrames = bytesPerFrame > 0 ? dataLength / bytesPerFrame : 0
+        let dBF = Int64(diskBytesPerFrame)
+        self.totalFrames = dBF > 0 ? dataLength / dBF : 0
 
         // 定位到数据区起点
         try source.seek(to: dataOffset)
@@ -127,11 +189,41 @@ public final class WAVDecoder: AudioDecoder {
 
     public func decode(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
         guard maxFrames > 0 else { return 0 }
-        let bytesPerFrame = format.bytesPerFrame
         let remainingFrames = totalFrames - currentFrame
         guard remainingFrames > 0 else { return 0 }
 
         let framesToRead = min(maxFrames, Int(remainingFrames))
+
+        if sourceIsFloat64 {
+            // 64-bit float 源：读入复用 scratch，再降转为 float32 写调用方 buffer
+            let bytesToRead = framesToRead * diskBytesPerFrame
+            if f64Scratch.count < bytesToRead {
+                f64Scratch = [UInt8](repeating: 0, count: bytesToRead)
+            }
+            var totalRead = 0
+            while totalRead < bytesToRead {
+                let n = try f64Scratch.withUnsafeMutableBufferPointer {
+                    try source.read(into: $0.baseAddress!.advanced(by: totalRead),
+                                    length: bytesToRead - totalRead)
+                }
+                if n <= 0 { break }
+                totalRead += n
+            }
+            let framesRead = totalRead / diskBytesPerFrame
+            let sampleCount = framesRead * format.channels
+            f64Scratch.withUnsafeBufferPointer { raw in
+                raw.baseAddress!.withMemoryRebound(to: Double.self, capacity: sampleCount) { dp in
+                    let out = buffer.assumingMemoryBound(to: Float.self)
+                    for i in 0..<sampleCount {
+                        out[i] = Float(dp[i])
+                    }
+                }
+            }
+            currentFrame += Int64(framesRead)
+            return framesRead
+        }
+
+        let bytesPerFrame = diskBytesPerFrame
         let bytesToRead = framesToRead * bytesPerFrame
 
         var totalRead = 0
@@ -151,8 +243,7 @@ public final class WAVDecoder: AudioDecoder {
 
     public func seek(to frame: Int64) throws {
         let clamped = max(0, min(frame, totalFrames))
-        let bytesPerFrame = Int64(format.bytesPerFrame)
-        try source.seek(to: dataChunkOffset + clamped * bytesPerFrame)
+        try source.seek(to: dataChunkOffset + clamped * Int64(diskBytesPerFrame))
         currentFrame = clamped
     }
 
