@@ -78,6 +78,10 @@ public final class PlayerController: @unchecked Sendable {
     public var playMode: PlayMode = .loopAll
     public private(set) var volume: Float = 0.75
 
+    /// issue #16：当前播放会话的中途欠载次数（曲尾正常排空不计）—
+    /// 供 UI/日志观察云盘流播的网络抖动
+    public var underrunCount: Int { pipeline?.underrunCount ?? 0 }
+
     private var pipeline: AudioPipeline?
     private let output: AudioOutputBackend
     public var dspPreferences: DSPPreferences
@@ -196,6 +200,58 @@ public final class PlayerController: @unchecked Sendable {
         hogAcquiredForCurrentPlay = false
     }
 
+    // MARK: - DSD 输出策略（issue #10）
+
+    /// DSD 起播接线：探测 DAC 的 DoP 载波能力；不支持时以 DSD2PCM
+    /// （float32 @ dsdRate/8）模式重建解码器，并用管线 SincResampler
+    /// 收敛到目标率。非 DSD 或 DoP 可用时原样返回 (解码器, 偏好)。
+    ///
+    /// 失败语义：source.seek(0) 抛错 → 保持原 DoP 路径（源状态未动）；
+    /// PCM 重建 init 解析的是同一文件头（原解码器刚解析成功过），
+    /// 实际不会失败，防御性 catch 同样回退原解码器。
+    private func makeDecoderApplyingDSDStrategy(
+        source: AudioSource, fileExtension ext: String
+    ) throws -> (AudioDecoder, DSPPreferences) {
+        let decoder = try DecoderRegistry.shared.makeDecoder(source: source, fileExtension: ext)
+        var prefs = dspPreferences
+        guard decoder.format.isDSD,
+              let rate = DSDRate(rawValue: Int(decoder.format.sampleRate * 16)),
+              ext == "dsf" || ext == "dff" else {
+            return (decoder, prefs)
+        }
+        // 探测结果桥接到 DACCapabilities（其 supportsDoP 按 maxPCMRate ≥ 载波率判定）
+        let dac: DACCapabilities
+        if let device = output.currentDevice {
+            let probe = DACCapabilityProbe.probe(device)
+            dac = DACCapabilities(
+                maxPCMRate: probe.supports(rate) ? rate.dopCarrierRate : 0,
+                isWhitelisted: probe.isWhitelisted
+            )
+        } else {
+            // 未知设备（系统默认输出）：保守视为不支持 DoP → PCM 回退保证可听
+            dac = DACCapabilities(maxPCMRate: 0)
+        }
+        let strategy = DSDStrategyChooser.choose(rate: rate, dac: dac, preference: .auto)
+        guard case .pcm(let targetRate) = strategy else { return (decoder, prefs) }
+
+        do {
+            try source.seek(to: 0)
+            let pcmDecoder: AudioDecoder = (ext == "dsf")
+                ? try DSFDecoder(source: source, pcmMode: true)
+                : try DFFDecoder(source: source, pcmMode: true)
+            // 转换输出率 = dsdRate/8；超过目标率或用户上限 → SincResampler 收敛
+            let convRate = Double(rate.rawValue) / 8.0
+            let cap = min(targetRate, AudioPreferences.dsdMaxPCMRate)
+            if convRate > cap { prefs.resamplerTargetRate = cap }
+            // DSD→PCM 已改变样本流，bit-perfect 语义不再成立；
+            // 解除 bypass 才能让上面的 resamplerTargetRate 生效
+            prefs.bitPerfect = false
+            return (pcmDecoder, prefs)
+        } catch {
+            return (decoder, prefs)
+        }
+    }
+
     // MARK: - 统一播放入口
 
     public func play(source: TrackSource) throws {
@@ -214,8 +270,10 @@ public final class PlayerController: @unchecked Sendable {
         stop()
         let ext = url.pathExtension.lowercased()
         let source = try LocalFileSource(url: url)
-        let decoder = try DecoderRegistry.shared.makeDecoder(source: source, fileExtension: ext)
-        let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: dspPreferences)
+        // issue #10：DSD 按 DAC 能力选 DoP / DSD2PCM 回退
+        let (decoder, effectivePrefs) = try makeDecoderApplyingDSDStrategy(
+            source: source, fileExtension: ext)
+        let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
         self.pipeline = pipe
@@ -236,8 +294,10 @@ public final class PlayerController: @unchecked Sendable {
         try await cloudSource.waitForPrebuffer()
         guard state == .buffering else { return }
 
-        let decoder = try DecoderRegistry.shared.makeDecoder(source: cloudSource, fileExtension: fileExtension)
-        let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: dspPreferences)
+        // issue #10：DSD 按 DAC 能力选 DoP / DSD2PCM 回退
+        let (decoder, effectivePrefs) = try makeDecoderApplyingDSDStrategy(
+            source: cloudSource, fileExtension: fileExtension)
+        let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
         self.pipeline = pipe
@@ -302,14 +362,11 @@ public final class PlayerController: @unchecked Sendable {
 
     public func resume() throws {
         guard state == .paused, let pipe = pipeline else { return }
+        // issue #16：与 AudioPipeline.start() 同一填充入口 —
+        // 欠载时从上一有效帧淡出而非硬插零
         try output.start(format: pipe.outputFormat) { [weak pipe] buffer, frames in
             guard let pipe else { return 0 }
-            let bytesNeeded = frames * pipe.outputFormat.bytesPerFrame
-            let read = pipe.ringBuffer.read(into: buffer, length: bytesNeeded)
-            if read < bytesNeeded {
-                memset(buffer.advanced(by: read), 0, bytesNeeded - read)
-            }
-            return read / pipe.outputFormat.bytesPerFrame
+            return pipe.fillRenderBuffer(buffer, frames: frames)
         }
         state = .playing
         startEndDetection()

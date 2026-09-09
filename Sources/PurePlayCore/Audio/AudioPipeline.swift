@@ -57,6 +57,27 @@ public final class AudioPipeline {
         Float(bitPattern: _volumeGainBits.load(ordering: .acquiring))
     }
 
+    // MARK: issue #16 — 欠载统计与淡出
+
+    /// 中途欠载次数（曲尾正常排空不计）— 供 UI/日志观察
+    public var underrunCount: Int { _underrunCount.load(ordering: .relaxed) }
+    private let _underrunCount = ManagedAtomic<Int>(0)
+
+    /// decodeLoop 每轮更新；渲染回调据此区分"中途欠载"与"曲尾排空"。
+    /// 回调里**不能**拿 seekLock（decode 可能正持锁做慢速网络读 → 优先级反转）
+    let decoderAtEndFlag = ManagedAtomic<Bool>(false)
+    private let hasProducedDataFlag = ManagedAtomic<Bool>(false)
+
+    /// 最近一次交给 HAL 的有效帧（淡出种子）。仅音频回调线程写入；
+    /// seek/stop 时从其他线程清零 — 字节级竞争无害（只是淡出起点值）。
+    /// 用原始缓冲而非 Array：避免 CoW 跨线程引用计数竞争。
+    private let lastFrameSeed: UnsafeMutableRawPointer
+    private let seedCapacity: Int
+
+    /// 欠载淡出长度（帧）：256 帧 @44.1k ≈ 5.8ms，足够消除可闻 click，
+    /// 又短到不掩盖真实信号
+    private static let underrunRampFrames = 256
+
     /// 设置软件音量（线性增益，clamp 到 0...4）。
     /// 仅当 DSP 链非 bypass 时被 decodeLoop 应用；bit-perfect 路径固定 unity。
     public func setVolume(linearGain gain: Float) {
@@ -123,12 +144,28 @@ public final class AudioPipeline {
         let bytesPerSecond = outFmt.sampleRate * Double(outFmt.bytesPerFrame)
         let capacity = max(65536, Int(bytesPerSecond * bufferDuration))
         self.ringBuffer = PCMRingBuffer(capacity: capacity)
+
+        // issue #16：淡出种子缓冲（容量 = 声道数 × 最大 4 字节样本，
+        // 覆盖 start() 里 outputFormat 重建后的任意样本格式）
+        self.seedCapacity = max(1, outFmt.channels * 4)
+        self.lastFrameSeed = UnsafeMutableRawPointer.allocate(byteCount: seedCapacity,
+                                                              alignment: 8)
+        self.lastFrameSeed.initializeMemory(as: UInt8.self, repeating: 0, count: seedCapacity)
+    }
+
+    deinit {
+        lastFrameSeed.deallocate()
     }
 
     /// 启动管线
     public func start() throws {
         guard !isRunning else { throw PurePlayError.alreadyPlaying }
         _isRunning.store(true, ordering: .releasing)
+        // issue #16：每次起播重置欠载统计与种子
+        _underrunCount.store(0, ordering: .relaxed)
+        hasProducedDataFlag.store(false, ordering: .relaxed)
+        decoderAtEndFlag.store(false, ordering: .relaxed)
+        memset(lastFrameSeed, 0, seedCapacity)
 
         // 切硬件采样率以匹配源文件（仅当用户选了具体设备）
         if let dev = output.currentDevice {
@@ -195,17 +232,108 @@ public final class AudioPipeline {
         self.decodeThread = thread
         thread.start()
 
-        // 启动音频输出
+        // 启动音频输出（issue #16：欠载时淡出补尾，不再硬插零）
         try output.start(format: outputFormat) { [weak self] buffer, frames in
             guard let self else { return 0 }
-            let bytesNeeded = frames * self.outputFormat.bytesPerFrame
-            let read = self.ringBuffer.read(into: buffer, length: bytesNeeded)
-            let framesRead = read / self.outputFormat.bytesPerFrame
-            if read < bytesNeeded {
-                memset(buffer.advanced(by: read), 0, bytesNeeded - read)
-            }
-            return framesRead
+            return self.fillRenderBuffer(buffer, frames: frames)
         }
+    }
+
+    /// issue #16：渲染回调统一填充入口 — ring 读取 + 欠载处理 + 统计。
+    ///
+    /// 欠载时不再 memset 0（前后样本跳变 → 可闻 click/pop），而是：
+    ///   1. 取最近一次有效帧作种子，向零做 ≤256 帧线性淡出；
+    ///   2. 淡出后仍不足的部分补零；
+    ///   3. 非曲尾（decoderAtEndFlag=false）且已出过声的欠载计入统计。
+    /// 始终返回 frames（整个 buffer 已填满）— AU 层不再二次补零覆盖淡出。
+    func fillRenderBuffer(_ buffer: UnsafeMutableRawPointer, frames: Int) -> Int {
+        let bpf = outputFormat.bytesPerFrame
+        guard bpf > 0, frames > 0 else { return 0 }
+        let bytesNeeded = frames * bpf
+        let read = ringBuffer.read(into: buffer, length: bytesNeeded)
+        if read > 0 {
+            hasProducedDataFlag.store(true, ordering: .relaxed)
+            if read >= bpf {
+                // 记录种子帧（本帧即下次欠载淡出的起点）
+                let src = buffer.advanced(by: read - bpf)
+                let n = min(bpf, seedCapacity)
+                for i in 0..<n {
+                    lastFrameSeed.storeBytes(of: src.load(fromByteOffset: i, as: UInt8.self),
+                                             toByteOffset: i, as: UInt8.self)
+                }
+            }
+        }
+        if read < bytesNeeded {
+            if hasProducedDataFlag.load(ordering: .relaxed),
+               !decoderAtEndFlag.load(ordering: .relaxed) {
+                _underrunCount.wrappingIncrement(ordering: .relaxed)
+            }
+            let shortfallFrames = (bytesNeeded - read) / bpf
+            let rampFrames = min(shortfallFrames, Self.underrunRampFrames)
+            let rampStart = buffer.advanced(by: read)
+            rampToZero(rampStart, frames: rampFrames)
+            let rampBytes = rampFrames * bpf
+            if bytesNeeded - read > rampBytes {
+                memset(rampStart.advanced(by: rampBytes), 0, bytesNeeded - read - rampBytes)
+            }
+            // 连续欠载：种子清零 — 下次回调若仍无数据，从 ~0 继续（纯静音），
+            // 不会从旧的大幅度帧重新起坡造成回跳
+            memset(lastFrameSeed, 0, seedCapacity)
+        }
+        return frames
+    }
+
+    /// 从种子帧向零线性淡出 frames 帧（逐样本，按输出格式解释字节）
+    private func rampToZero(_ dst: UnsafeMutableRawPointer, frames: Int) {
+        guard frames > 0 else { return }
+        let ch = outputFormat.channels
+        let bpf = outputFormat.bytesPerFrame
+        for f in 0..<frames {
+            // keep: f=0 → frames/(frames+1) ≈ 1；f=frames-1 → 1/(frames+1) ≈ 0
+            let keep = Float(frames - f) / Float(frames + 1)
+            let row = dst.advanced(by: f * bpf)
+            switch outputFormat.sampleFormat {
+            case .float32:
+                for c in 0..<ch {
+                    let s = lastFrameSeed.load(fromByteOffset: c * 4, as: Float.self)
+                    row.storeBytes(of: s * keep, toByteOffset: c * 4, as: Float.self)
+                }
+            case .int16:
+                for c in 0..<ch {
+                    let s = lastFrameSeed.load(fromByteOffset: c * 2, as: Int16.self)
+                    let v = Int16(clamping: Int(Float(s) * keep))
+                    row.storeBytes(of: v, toByteOffset: c * 2, as: Int16.self)
+                }
+            case .int24:
+                for c in 0..<ch {
+                    let s = Self.readInt24(lastFrameSeed, offset: c * 3)
+                    let v = Int32(clamping: Int(Float(s) * keep))
+                    Self.writeInt24(row, offset: c * 3, value: v)
+                }
+            case .int32:
+                for c in 0..<ch {
+                    let s = lastFrameSeed.load(fromByteOffset: c * 4, as: Int32.self)
+                    let v = Int32(clamping: Int(Double(s) * Double(keep)))
+                    row.storeBytes(of: v, toByteOffset: c * 4, as: Int32.self)
+                }
+            }
+        }
+    }
+
+    private static func readInt24(_ p: UnsafeRawPointer, offset: Int) -> Int32 {
+        let b0 = UInt32(p.load(fromByteOffset: offset, as: UInt8.self))
+        let b1 = UInt32(p.load(fromByteOffset: offset + 1, as: UInt8.self))
+        let b2 = UInt32(p.load(fromByteOffset: offset + 2, as: UInt8.self))
+        var v = Int32(bitPattern: b0 | (b1 << 8) | (b2 << 16))
+        if v & 0x0080_0000 != 0 { v |= ~0x00FF_FFFF }   // 符号扩展
+        return v
+    }
+
+    private static func writeInt24(_ p: UnsafeMutableRawPointer, offset: Int, value: Int32) {
+        let u = UInt32(bitPattern: value)
+        p.storeBytes(of: UInt8(u & 0xFF), toByteOffset: offset, as: UInt8.self)
+        p.storeBytes(of: UInt8((u >> 8) & 0xFF), toByteOffset: offset + 1, as: UInt8.self)
+        p.storeBytes(of: UInt8((u >> 16) & 0xFF), toByteOffset: offset + 2, as: UInt8.self)
     }
 
     /// 停止管线
@@ -215,6 +343,10 @@ public final class AudioPipeline {
         decodeThread?.cancel()
         decodeThread = nil
         ringBuffer.reset()
+        // issue #16：清欠载状态（统计保留到下次 start 归零，供 UI 读取）
+        hasProducedDataFlag.store(false, ordering: .relaxed)
+        decoderAtEndFlag.store(false, ordering: .relaxed)
+        memset(lastFrameSeed, 0, seedCapacity)
     }
 
     /// 跳转到指定帧。从任意线程调用安全。
@@ -224,6 +356,10 @@ public final class AudioPipeline {
         defer { seekLock.unlock() }
         try decoder.seek(to: frame)
         ringBuffer.reset()
+        // issue #16：seek 后的短暂空窗是用户操作导致，不算欠载；
+        // 种子清零避免用旧位置样本做淡出起点
+        hasProducedDataFlag.store(false, ordering: .relaxed)
+        memset(lastFrameSeed, 0, seedCapacity)
     }
 
     /// 是否可以无缝替换底层 decoder（gapless 前置条件）
@@ -296,6 +432,8 @@ public final class AudioPipeline {
             let currentDecoder = decoder
             let atEnd = currentDecoder.isAtEnd
             seekLock.unlock()
+            // issue #16：发布给渲染回调（区分中途欠载 vs 曲尾排空）
+            decoderAtEndFlag.store(atEnd, ordering: .relaxed)
 
             if atEnd {
                 let currentDecoderID = ObjectIdentifier(currentDecoder)

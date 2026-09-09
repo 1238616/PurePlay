@@ -1,18 +1,22 @@
 import Foundation
 
-/// Gesemann-style DSD → PCM 转换器
+/// DSD → PCM 转换器（Gesemann 风格架构，自生成系数）
 ///
-/// 借鉴：[dsd-pcm/dsd2pcm](https://github.com/dsd-pcm/dsd2pcm) 参考实现
+/// 架构借鉴：[dsd-pcm/dsd2pcm](https://github.com/dsd-pcm/dsd2pcm) 的
+/// per-byte 查表 FIR 思路；**系数不是 Gesemann 参考表**，而是本文件内
+/// 自生成的 Blackman-Harris 加窗 sinc（见 coefficients）——数学上
+/// cutoff = 1/16 × DSD rate，DC 增益归一化到 1。
 ///
 /// 算法：
 /// 1. 8-tap-per-byte 查表 FIR：把 8 个 1-bit DSD samples 一次性卷积成 1 个 float
 ///    一个 96-tap FIR 等效于跨 12 字节、每字节 8 sample 的对应权重和
 /// 2. 输出速率 = DSD bitstream / 8（每字节产 1 个样本）
-///    例：DSD64 2_822_400 Hz → 352_800 Hz PCM；继续 8x 抽取得到 44_100 Hz
+///    例：DSD64 2_822_400 Hz → 352_800 Hz PCM；更低目标率由管线
+///    SincResampler 二次收敛（issue #10）
 ///
 /// 实现细节：
-/// - 系数源：基于 Gesemann 提供的 96-tap 低通参考表，bit-MSB-first 假设
-///   （DFF 直接喂；DSF LSB-first 需要 reverse bit）
+/// - bit 序假设 MSB-first（DFF 直接喂；DSF LSB-first 需先 reverse bit，
+///   DSFDecoder PCM 模式已处理）
 /// - 256 项查表 × 12 字节窗口：每输出 1 sample = 12 次查表加和
 /// - 状态：12 字节窗口的 ring buffer per channel
 ///
@@ -102,9 +106,11 @@ public final class DSD2PCMConverter {
 
     // MARK: - Coefficient table
 
-    /// 96-tap FIR 低通系数（Gesemann 参考表，归一化到 DC 增益 = 1）
-    /// 这是公开领域的常量值；为了精简文件长度，使用 sinc·hamming 等价等价生成
-    /// 阻带 -110dB at 350kHz (DSD64)、通带平坦至 20kHz
+    /// 96-tap FIR 低通系数 — **自生成** Blackman-Harris 加窗 sinc，
+    /// cutoff = 1/16 × DSD rate（= 输出率的奈奎斯特），DC 增益归一化到 1。
+    /// 注意：这不是 Gesemann 的公开参考表常量（旧注释误导，issue #10 修正）；
+    /// 窗函数选择偏向深阻带（DSD64 下约 -110dB @ 350kHz 量级），
+    /// 通带平坦覆盖可听域。
     private static let coefficients: [Float] = {
         let taps = 96
         // 低通 cutoff = 1/16 of DSD rate (覆盖 PCM 输出带宽)

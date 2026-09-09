@@ -8,6 +8,12 @@ import Foundation
 /// 让低 byte 方向的高位仍是 DoP 标记字节，DAC 端 little-endian 读取后看到
 /// 的最高字节即标记，DoP 协议成立。
 ///
+/// issue #10：PCM 回退模式（pcmMode: true）
+/// DAC 不支持 DoP 载波率时，用 DSD2PCMConverter（96-tap FIR 查表）把 DSD
+/// 转成 float32 PCM，输出率 = dsdRate/8（DSD64 → 352.8kHz）；后续由管线
+/// SincResampler 按设备/用户偏好收敛。DSF 是 LSB-first，喂转换器前逐字节
+/// bit-reverse 成 MSB-first。
+///
 /// 限制：
 /// - 仅支持立体声 DSD (channelType=2, channelNum=2)
 /// - 仅支持 blockSizePerChannel = 4096（DSF spec 标准值）
@@ -25,7 +31,9 @@ public final class DSFDecoder: AudioDecoder {
     private let blockSizePerChannel: Int = 4096
     private let channels: Int
     private let dsdRate: Int
-    private let packer: DoPPacker
+    private let pcmMode: Bool
+    private let packer: DoPPacker?
+    private let converter: DSD2PCMConverter?
 
     /// 当前块对缓存：channels × blockSizePerChannel 字节
     private var blockBuffer: [UInt8]
@@ -33,8 +41,10 @@ public final class DSFDecoder: AudioDecoder {
     private var posInBlock: Int = 0
     /// 已加载块对的字节数（块对完整时 = channels * blockSizePerChannel）
     private var blockValid: Int = 0
+    /// PCM 模式去交错暂存（LSB→MSB 反转后的 interleaved DSD 字节）
+    private var pcmScratch: [UInt8] = []
 
-    public init(source: AudioSource) throws {
+    public init(source: AudioSource, pcmMode: Bool = false) throws {
         self.source = source
 
         // === DSD chunk (28 bytes) ===
@@ -87,6 +97,7 @@ public final class DSFDecoder: AudioDecoder {
 
         self.channels = channelNum
         self.dsdRate = sampleFreq
+        self.pcmMode = pcmMode
 
         // === data chunk header (12 bytes: "data" + 8B size) ===
         var dataHeader = [UInt8](repeating: 0, count: 12)
@@ -101,27 +112,45 @@ public final class DSFDecoder: AudioDecoder {
         // current source position = 28 + 52 + 12 = 92
         self.dataChunkOffset = 92
 
-        // DoP carrier rate = DSD rate / 16
-        let dopRate = Double(sampleFreq) / 16.0
-        self.format = AudioFormat(
-            sampleRate: dopRate,
-            channels: channelNum,
-            sampleFormat: .int24,
-            isDSD: true,
-            sourceBitDepth: 1
-        )
+        if pcmMode {
+            // issue #10：DSD2PCM → float32 @ dsdRate/8（1 DSD 字节 → 1 PCM 样本）
+            self.format = AudioFormat(
+                sampleRate: Double(sampleFreq) / 8.0,
+                channels: channelNum,
+                sampleFormat: .float32,
+                isDSD: false,
+                sourceBitDepth: nil
+            )
+            self.totalFrames = Int64(sampleCountPerChannel) / 8
+            self.packer = nil
+            self.converter = DSD2PCMConverter(channels: channelNum,
+                                              dsdBitstreamRate: Double(sampleFreq))
+        } else {
+            // DoP carrier rate = DSD rate / 16
+            let dopRate = Double(sampleFreq) / 16.0
+            self.format = AudioFormat(
+                sampleRate: dopRate,
+                channels: channelNum,
+                sampleFormat: .int24,
+                isDSD: true,
+                sourceBitDepth: 1
+            )
 
-        // 1 DoP frame = 16 DSD bits per channel = 2 DSD bytes per channel
-        // total DoP frames = sampleCountPerChannel / 16
-        self.totalFrames = Int64(sampleCountPerChannel) / 16
+            // 1 DoP frame = 16 DSD bits per channel = 2 DSD bytes per channel
+            // total DoP frames = sampleCountPerChannel / 16
+            self.totalFrames = Int64(sampleCountPerChannel) / 16
 
-        self.packer = DoPPacker(bitOrder: .lsbFirst, channels: channelNum)
+            self.packer = DoPPacker(bitOrder: .lsbFirst, channels: channelNum)
+            self.converter = nil
+        }
         self.blockBuffer = [UInt8](repeating: 0, count: channelNum * blockSize)
     }
 
     // MARK: AudioDecoder
 
     public func decode(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
+        if pcmMode { return try decodePCM(into: buffer, maxFrames: maxFrames) }
+        guard let packer else { return 0 }
         guard maxFrames > 0 else { return 0 }
         let remainingFrames = totalFrames - currentFrame
         guard remainingFrames > 0 else { return 0 }
@@ -140,7 +169,9 @@ public final class DSFDecoder: AudioDecoder {
 
         while framesProduced < framesWanted {
             // 确保块缓存有足够 2 字节/声道供本帧使用
-            if posInBlock + 2 > blockSizePerChannel {
+            // 用 blockValid 做阈值：初始 blockValid=0 → 首轮必加载第一块对
+            // （旧代码误用 blockSizePerChannel，首块永不加载 → 开头一块静音）
+            if posInBlock + 2 > blockValid / channels {
                 // 当前块对已用尽 → 加载下一块对
                 let n = try blockBuffer.withUnsafeMutableBufferPointer { buf -> Int in
                     return try source.read(into: buf.baseAddress!, length: buf.count)
@@ -186,10 +217,58 @@ public final class DSFDecoder: AudioDecoder {
         return framesProduced
     }
 
+    /// issue #10：PCM 回退路径 — 块对内去交错 + LSB→MSB bit-reverse，
+    /// 喂 DSD2PCMConverter，1 DSD 字节/声道 → 1 float 样本/声道
+    private func decodePCM(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
+        guard let conv = converter, maxFrames > 0 else { return 0 }
+        let remainingFrames = totalFrames - currentFrame
+        guard remainingFrames > 0 else { return 0 }
+        let framesWanted = min(maxFrames, Int(remainingFrames))
+        let out = buffer.assumingMemoryBound(to: Float.self)
+
+        if pcmScratch.count < framesWanted * channels {
+            pcmScratch = [UInt8](repeating: 0x69, count: framesWanted * channels)
+        }
+
+        var framesProduced = 0
+        while framesProduced < framesWanted {
+            // PCM 模式每帧只消耗 1 DSD 字节/声道
+            // blockValid 阈值：初始 0 → 首轮必加载第一块对
+            if posInBlock >= blockValid / channels {
+                let n = try blockBuffer.withUnsafeMutableBufferPointer { buf -> Int in
+                    return try source.read(into: buf.baseAddress!, length: buf.count)
+                }
+                if n == 0 { break }
+                blockValid = n
+                posInBlock = 0
+            }
+            let want = min(framesWanted - framesProduced, blockSizePerChannel - posInBlock)
+            for f in 0..<want {
+                for c in 0..<channels {
+                    let b = blockBuffer[c * blockSizePerChannel + posInBlock + f]
+                    pcmScratch[f * channels + c] = DoPPacker.reverse(b)
+                }
+            }
+            let produced = pcmScratch.withUnsafeBufferPointer { src -> Int in
+                conv.process(dsdInterleaved: src.baseAddress!,
+                             inputFrames: want,
+                             output: out.advanced(by: framesProduced * channels),
+                             outputCapacityFrames: framesWanted - framesProduced)
+            }
+            guard produced > 0 else { break }
+            posInBlock += produced
+            framesProduced += produced
+            if produced < want { break }
+        }
+
+        currentFrame += Int64(framesProduced)
+        return framesProduced
+    }
+
     public func seek(to frame: Int64) throws {
         let clamped = max(0, min(frame, totalFrames))
-        // 1 DoP frame = 2 DSD bytes/channel
-        let dsdByteOffsetInChannel = Int(clamped) * 2
+        // DoP：1 帧 = 2 DSD 字节/声道；PCM：1 帧 = 1 DSD 字节/声道
+        let dsdByteOffsetInChannel = Int(clamped) * (pcmMode ? 1 : 2)
         let blockIndex = dsdByteOffsetInChannel / blockSizePerChannel
         let inBlock = dsdByteOffsetInChannel % blockSizePerChannel
 
@@ -202,7 +281,11 @@ public final class DSFDecoder: AudioDecoder {
         blockValid = n
         posInBlock = inBlock
         currentFrame = clamped
-        packer.resetMarker()
+        if pcmMode {
+            converter?.reset()
+        } else {
+            packer?.resetMarker()
+        }
     }
 
     public func close() {

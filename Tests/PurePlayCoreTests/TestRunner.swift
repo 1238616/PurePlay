@@ -986,6 +986,27 @@ runTest("dsfMarkerAlternation") {
     try assertEqual(frame3Ch0, UInt8(0xFA))
 }
 
+runTest("dsfDoPFirstBlockPayloadNotSilence") {
+    // 回归：旧代码首块对从不加载（条件误用 blockSizePerChannel），
+    // 无 seek 直接 decode 时开头一块全零静音。
+    // 常量字节模式下 DoP payload 与字节序无关：ch0=0xFF → 0xFFFF，ch1=0x00 → 0x0000
+    let data = DSFTestHelper.makeMinimalDSF(
+        sampleFreq: 2_822_400, blocks: 1,
+        channelPattern: { ch, _ in ch == 0 ? 0xFF : 0x00 })
+    let decoder = try DSFDecoder(source: MemorySource(data: data))
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 6, alignment: 4)
+    defer { buf.deallocate() }
+    let frames = try decoder.decode(into: buf, maxFrames: 1)
+    try assertEqual(frames, 1)
+    let p = buf.assumingMemoryBound(to: UInt8.self)
+    try assertEqual(p[0], UInt8(0xFF), "ch0 payload lo 应为真实数据 0xFF")
+    try assertEqual(p[1], UInt8(0xFF), "ch0 payload hi 应为真实数据 0xFF")
+    try assertEqual(p[2], UInt8(0x05))
+    try assertEqual(p[3], UInt8(0x00))
+    try assertEqual(p[4], UInt8(0x00))
+    try assertEqual(p[5], UInt8(0x05))
+}
+
 runTest("dsfSeekRepositionsAndResetsMarker") {
     let data = DSFTestHelper.makeMinimalDSF(sampleFreq: 2_822_400, blocks: 1)
     let source = MemorySource(data: data)
@@ -1369,6 +1390,126 @@ runTest("pipelineSeekResetsRingBuffer") {
     try assertEqual(pipeline.ringBuffer.availableToRead, 0)
     try assertEqual(decoder.currentFrame, 22050)
     pipeline.stop()
+}
+
+// ─── issue #16：欠载淡出（fade-out）代替硬插零 ───
+
+runTest("pipelineUnderrunFadesToZeroFloat32") {
+    // bitPerfect 默认 → chain bypass → float32 直通输出（bpf = 8）
+    let decoder = SineDecoder(sampleRate: 44100, channels: 2, durationSeconds: 0.1)
+    let pipe = AudioPipeline(decoder: decoder, output: MockAudioOutput())
+    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+
+    // 手动写入 2 帧常量种子 [0.5, -0.5]，不启动解码线程
+    var seed: [Float] = [0.5, -0.5, 0.5, -0.5]
+    let written = seed.withUnsafeBufferPointer { p in
+        pipe.ringBuffer.write(p.baseAddress!, length: 16)
+    }
+    try assertEqual(written, 16)
+
+    // 拉 6 帧：前 2 帧是真实数据，后 4 帧应是淡出坡而非硬零
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 48, alignment: 8)
+    defer { buf.deallocate() }
+    memset(buf, 0xAB, 48)
+    let got = pipe.fillRenderBuffer(buf, frames: 6)
+    try assertEqual(got, 6, "欠载时必须返回满帧数，防止 AU 层整段 memset")
+    let f = buf.bindMemory(to: Float.self, capacity: 12)
+    try assertEqual(f[0], 0.5)
+    try assertEqual(f[1], -0.5)
+    try assertEqual(f[2], 0.5)
+    try assertEqual(f[3], -0.5)
+    // ramp 4 帧：keep = (4-i)/5 → 0.8 / 0.6 / 0.4 / 0.2
+    let keeps: [Float] = [0.8, 0.6, 0.4, 0.2]
+    for i in 0..<4 {
+        try assertTrue(abs(f[4 + i * 2] - 0.5 * keeps[i]) < 1e-6,
+                       "ramp 帧 \(i) 左声道应为 0.5*\(keeps[i])，实际 \(f[4 + i * 2])")
+        try assertTrue(abs(f[5 + i * 2] + 0.5 * keeps[i]) < 1e-6,
+                       "ramp 帧 \(i) 右声道应为 -0.5*\(keeps[i])，实际 \(f[5 + i * 2])")
+    }
+    try assertEqual(pipe.underrunCount, 1, "播放中途欠载应计数一次")
+
+    // 连续欠载：种子已清零 → 纯静音延续，不会从旧大幅度帧回跳
+    let got2 = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(got2, 4)
+    for i in 0..<8 {
+        try assertEqual(f[i], 0.0, "第二次欠载应为纯静音")
+    }
+    try assertEqual(pipe.underrunCount, 2)
+}
+
+runTest("pipelineUnderrunFadesInt24") {
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = false
+    let pipe = AudioPipeline(decoder: SineDecoder(sampleRate: 44100, channels: 2,
+                                                  durationSeconds: 0.1),
+                             output: MockAudioOutput(), dspPreferences: prefs)
+    try assertEqual(pipe.outputFormat.sampleFormat, .int24)
+    // 1 帧 [0x400000, 0x400000] LE 3 字节
+    var seedBytes: [UInt8] = [0x00, 0x00, 0x40, 0x00, 0x00, 0x40]
+    let written = seedBytes.withUnsafeBufferPointer { p in
+        pipe.ringBuffer.write(p.baseAddress!, length: 6)
+    }
+    try assertEqual(written, 6)
+
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 24, alignment: 8)
+    defer { buf.deallocate() }
+    let got = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(got, 4)
+    let raw = buf.bindMemory(to: UInt8.self, capacity: 24)
+    func rd24(_ frame: Int) -> Int32 {
+        var v = Int32(raw[frame * 6]) | (Int32(raw[frame * 6 + 1]) << 8)
+            | (Int32(raw[frame * 6 + 2]) << 16)
+        if v & 0x0080_0000 != 0 { v |= ~0x00FF_FFFF }
+        return v
+    }
+    try assertEqual(rd24(0), 0x400000, "首帧应是种子数据")
+    // ramp 3 帧：keep = 3/4, 2/4, 1/4 → 0x300000 / 0x200000 / 0x100000
+    try assertEqual(rd24(1), 0x300000)
+    try assertEqual(rd24(2), 0x200000)
+    try assertEqual(rd24(3), 0x100000)
+    try assertEqual(pipe.underrunCount, 1)
+}
+
+runTest("pipelineEndDrainNotCountedAsUnderrun") {
+    let pipe = AudioPipeline(decoder: SineDecoder(sampleRate: 44100, channels: 2,
+                                                  durationSeconds: 0.1),
+                             output: MockAudioOutput())
+    var seed: [Float] = [0.5, -0.5]
+    _ = seed.withUnsafeBufferPointer { p in pipe.ringBuffer.write(p.baseAddress!, length: 8) }
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 32, alignment: 8)
+    defer { buf.deallocate() }
+    // 中途欠载计 1 次
+    _ = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(pipe.underrunCount, 1)
+    // 曲尾排空：解码器已到末尾 → 不再计数，但仍返回满帧静音
+    pipe.decoderAtEndFlag.store(true, ordering: .relaxed)
+    let got = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(got, 4)
+    let f = buf.bindMemory(to: Float.self, capacity: 8)
+    for i in 0..<8 { try assertEqual(f[i], 0.0) }
+    try assertEqual(pipe.underrunCount, 1, "曲尾正常排空不应计入欠载")
+}
+
+runTest("pipelineSeekResetsUnderrunAccounting") {
+    let pipe = AudioPipeline(decoder: SineDecoder(sampleRate: 44100, channels: 2,
+                                                  durationSeconds: 1.0),
+                             output: MockAudioOutput())
+    var seed: [Float] = [0.5, -0.5]
+    _ = seed.withUnsafeBufferPointer { p in pipe.ringBuffer.write(p.baseAddress!, length: 8) }
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 32, alignment: 8)
+    defer { buf.deallocate() }
+    _ = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(pipe.underrunCount, 1)
+    // seek 造成的空洞不是网络欠载 — 计数不应增长
+    try pipe.seek(toFrame: 22050)
+    _ = pipe.fillRenderBuffer(buf, frames: 4)
+    try assertEqual(pipe.underrunCount, 1, "seek 空洞不应计入欠载")
+}
+
+runTest("playerControllerExposesUnderrunCount") {
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)
+    try assertEqual(pc.underrunCount, 0, "无管线时应为 0")
 }
 
 runTest("playerSeekToFractionMid") {
@@ -3553,6 +3694,148 @@ runTest("dsd2pcmCapacityLimit") {
                      inputFrames: 32, output: output, outputCapacityFrames: 10)
     }
     try assertLessThanOrEqual(produced, 10)
+}
+
+// ─── issue #10：DSD PCM 回退（解码器 PCM 模式 + PlayerController 接线）───
+
+runTest("dopPackerReverseIsBitMirror") {
+    try assertEqual(DoPPacker.reverse(0x0F), 0xF0)
+    try assertEqual(DoPPacker.reverse(0xAA), 0x55)
+    try assertEqual(DoPPacker.reverse(0x00), 0x00)
+    try assertEqual(DoPPacker.reverse(0xFF), 0xFF)
+    for v in 0...255 {
+        try assertEqual(DoPPacker.reverse(DoPPacker.reverse(UInt8(v))), UInt8(v))
+    }
+}
+
+runTest("dsfDecoderPCMModeFormat") {
+    let data = DSFTestHelper.makeMinimalDSF(sampleFreq: 2_822_400, blocks: 1)
+    let dec = try DSFDecoder(source: MemorySource(data: data), pcmMode: true)
+    try assertEqual(dec.format.sampleRate, 352_800.0)   // dsdRate / 8
+    try assertEqual(dec.format.sampleFormat, .float32)
+    try assertFalse(dec.format.isDSD)
+    try assertEqual(dec.totalFrames, 4096)              // 1 DSD 字节/帧/声道
+    // 对照：DoP 模式 1 帧 = 2 DSD 字节/声道
+    let dop = try DSFDecoder(source: MemorySource(data: data), pcmMode: false)
+    try assertEqual(dop.totalFrames, 2048)
+    try assertTrue(dop.format.isDSD)
+    try assertEqual(dop.format.sampleFormat, .int24)
+}
+
+runTest("dsfDecoderPCMModeDecodesDC") {
+    // ch0 = 0xFF（全 1 → +1 DC），ch1 = 0x00（全 0 → -1 DC）；FIR DC 增益 = 1
+    let data = DSFTestHelper.makeMinimalDSF(
+        sampleFreq: 2_822_400, blocks: 1,
+        channelPattern: { ch, _ in ch == 0 ? 0xFF : 0x00 })
+    let dec = try DSFDecoder(source: MemorySource(data: data), pcmMode: true)
+    let n = 512
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: n * 2 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let got = try dec.decode(into: buf, maxFrames: n)
+    try assertEqual(got, n)
+    let f = buf.bindMemory(to: Float.self, capacity: n * 2)
+    // 滤波器稳定后（12 字节窗口 + 余量）ch0 ≈ +1、ch1 ≈ -1
+    for i in 100..<n {
+        try assertTrue(abs(f[i * 2] - 1.0) < 0.05,
+                       "ch0 应 ≈ +1.0，帧 \(i) 实际 \(f[i * 2])")
+        try assertTrue(abs(f[i * 2 + 1] + 1.0) < 0.05,
+                       "ch1 应 ≈ -1.0，帧 \(i) 实际 \(f[i * 2 + 1])")
+    }
+    try assertEqual(dec.currentFrame, Int64(n))
+}
+
+runTest("dsfDecoderPCMSeekResetsConverter") {
+    let data = DSFTestHelper.makeMinimalDSF(
+        sampleFreq: 2_822_400, blocks: 2,
+        channelPattern: { ch, _ in ch == 0 ? 0xFF : 0x00 })
+    let dec = try DSFDecoder(source: MemorySource(data: data), pcmMode: true)
+    try assertEqual(dec.totalFrames, 8192)
+    try dec.seek(to: 4096)   // 恰好跨到第 2 个块对
+    try assertEqual(dec.currentFrame, 4096)
+    let n = 64
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: n * 2 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let got = try dec.decode(into: buf, maxFrames: n)
+    try assertEqual(got, n)
+    let f = buf.bindMemory(to: Float.self, capacity: n * 2)
+    for i in 20..<n {
+        try assertTrue(abs(f[i * 2] - 1.0) < 0.05)
+        try assertTrue(abs(f[i * 2 + 1] + 1.0) < 0.05)
+    }
+    try assertEqual(dec.currentFrame, 4096 + Int64(n))
+}
+
+runTest("dffDecoderPCMModeDecodesDC") {
+    // DFF 是 MSB-first 交错 — 无需 bit-reverse，直接喂转换器
+    let data = DFFTestHelper.makeMinimalDFF(
+        sampleFreq: 2_822_400, framesPerChannel: 512,
+        channelPattern: { ch, _ in ch == 0 ? 0xFF : 0x00 })
+    let dec = try DFFDecoder(source: MemorySource(data: data), pcmMode: true)
+    try assertEqual(dec.format.sampleRate, 352_800.0)
+    try assertEqual(dec.format.sampleFormat, .float32)
+    try assertFalse(dec.format.isDSD)
+    try assertEqual(dec.totalFrames, 512)   // 1 DSD 字节/帧/声道
+    let n = 512
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: n * 2 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    let got = try dec.decode(into: buf, maxFrames: n)
+    try assertEqual(got, n)
+    let f = buf.bindMemory(to: Float.self, capacity: n * 2)
+    for i in 100..<n {
+        try assertTrue(abs(f[i * 2] - 1.0) < 0.05,
+                       "ch0 应 ≈ +1.0，帧 \(i) 实际 \(f[i * 2])")
+        try assertTrue(abs(f[i * 2 + 1] + 1.0) < 0.05,
+                       "ch1 应 ≈ -1.0，帧 \(i) 实际 \(f[i * 2 + 1])")
+    }
+}
+
+runTest("playerDSDPCMFallbackWhenDeviceLacksDoPCarrier") {
+    AudioPreferences.hogEnabled = false
+    let data = DSFTestHelper.makeMinimalDSF(sampleFreq: 2_822_400, blocks: 2)
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pp_dsd_pcm_\(UUID().uuidString).dsf")
+    try data.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let out = MockAudioOutput()
+    let limited = AudioDevice(id: 95, name: "PCM Only Unit", uid: "pcm-only-95",
+                              maxSampleRate: 48000, supportedRates: [44100, 48000])
+    try out.setDevice(limited)
+    let pc = PlayerController(output: out)
+    try pc.playLocal(url: tmp)
+    try assertEqual(pc.state, .playing)
+    let fmt = pc.currentFormat
+    try assertTrue(fmt != nil)
+    try assertFalse(fmt!.isDSD, "DAC 不支持 DoP 载波率时应回退 DSD2PCM")
+    try assertEqual(fmt!.sampleFormat, .float32)
+    try assertEqual(fmt!.sampleRate, 352_800.0)
+    pc.stop()
+    AudioPreferences.deviceUID = nil
+}
+
+runTest("playerDSDKeepsDoPWhenDeviceSupportsCarrier") {
+    AudioPreferences.hogEnabled = false
+    let data = DSFTestHelper.makeMinimalDSF(sampleFreq: 2_822_400, blocks: 2)
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pp_dsd_dop_\(UUID().uuidString).dsf")
+    try data.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let out = MockAudioOutput()
+    let dopDev = AudioDevice(id: 94, name: "DoP Capable Unit", uid: "dop-94",
+                             maxSampleRate: 176400,
+                             supportedRates: [44100, 48000, 88200, 176400])
+    try out.setDevice(dopDev)
+    let pc = PlayerController(output: out)
+    try pc.playLocal(url: tmp)
+    try assertEqual(pc.state, .playing)
+    let fmt = pc.currentFormat
+    try assertTrue(fmt != nil)
+    try assertTrue(fmt!.isDSD, "载波率受支持时应保持 DoP")
+    try assertEqual(fmt!.sampleFormat, .int24)
+    try assertEqual(fmt!.sampleRate, 176_400.0)
+    pc.stop()
+    AudioPreferences.deviceUID = nil
 }
 
 // ═══════════════════════════════════════════════════════

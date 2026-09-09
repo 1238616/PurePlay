@@ -9,6 +9,11 @@ import Foundation
 ///     字节流 = L0, R0, L1, R1, L2, R2, ...
 /// - 顶层容器 "FRM8" 而不是 RIFF/DSF
 ///
+/// issue #10：PCM 回退模式（pcmMode: true）
+/// DAC 不支持 DoP 载波率时，用 DSD2PCMConverter（96-tap FIR 查表）把 DSD
+/// 转成 float32 PCM，输出率 = dsdRate/8。DFF 本身是 MSB-first 字节交错
+/// （L0,R0,L1,R1…），与转换器输入布局一致 — 直接喂，无需重排/反转。
+///
 /// 实现限制：
 /// - 仅支持立体声
 /// - 仅支持未压缩 DSD（PROP/SND/CMPR 字段为 "DSD "）
@@ -26,14 +31,16 @@ public final class DFFDecoder: AudioDecoder {
     private let dataChunkLength: Int64
     private let channels: Int
     private let dsdRate: Int
-    private let packer: DoPPacker
+    private let pcmMode: Bool
+    private let packer: DoPPacker?
+    private let converter: DSD2PCMConverter?
 
     /// I/O 缓冲：一次读 8KB 交错 DSD 字节
     private var ioBuffer: [UInt8]
     private var ioBufferValid: Int = 0
     private var ioBufferPos: Int = 0
 
-    public init(source: AudioSource) throws {
+    public init(source: AudioSource, pcmMode: Bool = false) throws {
         self.source = source
 
         // === FRM8 容器头 ===
@@ -159,24 +166,43 @@ public final class DFFDecoder: AudioDecoder {
         self.dsdRate = sampleFreq
         self.dataChunkOffset = dataOffset
         self.dataChunkLength = dataLength
+        self.pcmMode = pcmMode
 
-        // DoP frame = 16 DSD bits per channel = 2 bytes per channel.
-        // 交错布局：每帧 channels × 2 字节 = 4 bytes（stereo）
-        // total DoP frames = dataLength / (channels * 2)
-        self.totalFrames = dataLength / Int64(channelNum * 2)
+        if pcmMode {
+            // issue #10：DSD2PCM → float32 @ dsdRate/8（1 DSD 字节 → 1 PCM 样本）
+            // 交错布局：每帧 channels × 1 字节
+            self.totalFrames = dataLength / Int64(channelNum)
+            self.format = AudioFormat(
+                sampleRate: Double(sampleFreq) / 8.0,
+                channels: channelNum,
+                sampleFormat: .float32,
+                isDSD: false,
+                sourceBitDepth: nil
+            )
+            self.packer = nil
+            self.converter = DSD2PCMConverter(channels: channelNum,
+                                              dsdBitstreamRate: Double(sampleFreq))
+        } else {
+            // DoP frame = 16 DSD bits per channel = 2 bytes per channel.
+            // 交错布局：每帧 channels × 2 字节 = 4 bytes（stereo）
+            // total DoP frames = dataLength / (channels * 2)
+            self.totalFrames = dataLength / Int64(channelNum * 2)
 
-        let dopRate = Double(sampleFreq) / 16.0
-        self.format = AudioFormat(
-            sampleRate: dopRate,
-            channels: channelNum,
-            sampleFormat: .int24,
-            isDSD: true,
-            sourceBitDepth: 1
-        )
+            let dopRate = Double(sampleFreq) / 16.0
+            self.format = AudioFormat(
+                sampleRate: dopRate,
+                channels: channelNum,
+                sampleFormat: .int24,
+                isDSD: true,
+                sourceBitDepth: 1
+            )
+
+            // DFF = MSB-first（不需要 bit-reverse）
+            self.packer = DoPPacker(bitOrder: .msbFirst, channels: channelNum)
+            self.converter = nil
+        }
         _ = bitsPerSample  // reserved
 
-        // DFF = MSB-first（不需要 bit-reverse）
-        self.packer = DoPPacker(bitOrder: .msbFirst, channels: channelNum)
         self.ioBuffer = [UInt8](repeating: 0, count: 8192)
 
         // 定位到 DSD 数据起点
@@ -186,6 +212,8 @@ public final class DFFDecoder: AudioDecoder {
     // MARK: AudioDecoder
 
     public func decode(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
+        if pcmMode { return try decodePCM(into: buffer, maxFrames: maxFrames) }
+        guard let packer else { return 0 }
         guard maxFrames > 0 else { return 0 }
         let remaining = totalFrames - currentFrame
         guard remaining > 0 else { return 0 }
@@ -257,15 +285,65 @@ public final class DFFDecoder: AudioDecoder {
         return framesProduced
     }
 
+    /// issue #10：PCM 回退路径 — ioBuffer 的交错布局（L0,R0,L1,R1…）与
+    /// DSD2PCMConverter 输入一致且已是 MSB-first，直接喂
+    private func decodePCM(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
+        guard let conv = converter, maxFrames > 0 else { return 0 }
+        let remaining = totalFrames - currentFrame
+        guard remaining > 0 else { return 0 }
+        let framesWanted = min(maxFrames, Int(remaining))
+        let out = buffer.assumingMemoryBound(to: Float.self)
+        let bytesPerFrameDSD = channels   // 1 字节/声道/帧
+
+        var framesProduced = 0
+        while framesProduced < framesWanted {
+            if ioBufferPos + bytesPerFrameDSD > ioBufferValid {
+                // 残留前移 + 重填（与 DoP 路径同款逻辑）
+                let leftover = ioBufferValid - ioBufferPos
+                if leftover > 0 {
+                    for i in 0..<leftover {
+                        ioBuffer[i] = ioBuffer[ioBufferPos + i]
+                    }
+                }
+                let n = try ioBuffer.withUnsafeMutableBufferPointer { buf -> Int in
+                    let target = buf.baseAddress!.advanced(by: leftover)
+                    return try source.read(into: target, length: buf.count - leftover)
+                }
+                ioBufferValid = leftover + n
+                ioBufferPos = 0
+                if ioBufferValid < bytesPerFrameDSD { break }
+            }
+            let availFrames = (ioBufferValid - ioBufferPos) / bytesPerFrameDSD
+            let want = min(framesWanted - framesProduced, availFrames)
+            let produced = ioBuffer.withUnsafeBufferPointer { src -> Int in
+                conv.process(dsdInterleaved: src.baseAddress!.advanced(by: ioBufferPos),
+                             inputFrames: want,
+                             output: out.advanced(by: framesProduced * channels),
+                             outputCapacityFrames: framesWanted - framesProduced)
+            }
+            guard produced > 0 else { break }
+            ioBufferPos += produced * bytesPerFrameDSD
+            framesProduced += produced
+            if produced < want { break }
+        }
+
+        currentFrame += Int64(framesProduced)
+        return framesProduced
+    }
+
     public func seek(to frame: Int64) throws {
         let clamped = max(0, min(frame, totalFrames))
-        // 1 DoP frame = channels × 2 字节 interleaved
-        let byteOffset = clamped * Int64(channels * 2)
+        // DoP：1 帧 = channels × 2 字节；PCM：1 帧 = channels × 1 字节
+        let byteOffset = clamped * Int64(channels * (pcmMode ? 1 : 2))
         try source.seek(to: dataChunkOffset + byteOffset)
         ioBufferValid = 0
         ioBufferPos = 0
         currentFrame = clamped
-        packer.resetMarker()
+        if pcmMode {
+            converter?.reset()
+        } else {
+            packer?.resetMarker()
+        }
     }
 
     public func close() {

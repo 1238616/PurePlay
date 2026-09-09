@@ -124,8 +124,8 @@ public final class DoPPacker {
         return true
     }
 
-    /// 比特反转表
-    private static func reverse(_ b: UInt8) -> UInt8 {
+    /// 比特反转（LSB-first ↔ MSB-first）。issue #10：DSF PCM 回退也复用
+    static func reverse(_ b: UInt8) -> UInt8 {
         var x = b
         x = (x >> 4) | (x << 4)
         x = ((x & 0xCC) >> 2) | ((x & 0x33) << 2)
