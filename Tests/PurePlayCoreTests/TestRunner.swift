@@ -3530,7 +3530,9 @@ runTest("trimmingDecoderSeek") {
     let trim = try TrimmingDecoder(inner: inner, startFrame: 1000, endFrame: 3000)
     try trim.seek(to: 500)
     try assertEqual(trim.currentFrame, 500)
-    let buf = UnsafeMutableRawPointer.allocate(byteCount: 4000, alignment: 16)
+    // 1500 帧 × 4 字节（int16 立体声）= 6000；旧值 4000 会堆溢出
+    // 2000 字节（Guard Malloc 下在 MemorySource.read 的 memmove 处即崩）
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 6000, alignment: 16)
     defer { buf.deallocate() }
     let n = try trim.decode(into: buf, maxFrames: 1500)
     try assertEqual(n, 1500)
@@ -3965,6 +3967,253 @@ runTest("playerControllerSignalPathNilWhenStopped") {
     let pc = PlayerController(output: out)
     try assertTrue(pc.currentSignalPath() == nil)
 }
+
+// ─── issue #8 ReplayGain 接线 + issue #12 FLAC MD5 校验接线 ───
+
+runTest("audioPrefsReplayGainModeNormalizes") {
+    UserDefaults.standard.removeObject(forKey: "ppl.replayGainMode")
+    try assertEqual(AudioPreferences.replayGainMode, "off")   // 默认
+    AudioPreferences.replayGainMode = "track"
+    try assertEqual(AudioPreferences.replayGainMode, "track")
+    AudioPreferences.replayGainMode = "album"
+    try assertEqual(AudioPreferences.replayGainMode, "album")
+    AudioPreferences.replayGainMode = "bogus"
+    try assertEqual(AudioPreferences.replayGainMode, "off")   // 非法值归一化
+    AudioPreferences.replayGainMode = "off"
+}
+
+runTest("audioPrefsFlacMD5VerifyDefaultsTrue") {
+    UserDefaults.standard.removeObject(forKey: "ppl.flacMD5Verify")
+    try assertTrue(AudioPreferences.flacMD5Verify)   // 未设置 = 默认开
+    AudioPreferences.flacMD5Verify = false
+    try assertFalse(AudioPreferences.flacMD5Verify)
+    AudioPreferences.flacMD5Verify = true
+    try assertTrue(AudioPreferences.flacMD5Verify)
+    UserDefaults.standard.removeObject(forKey: "ppl.flacMD5Verify")
+}
+
+runTest("replayGainSelectGainModes") {
+    var md = TrackMetadata(duration: 0)
+    try assertTrue(ReplayGainReader.selectGain(mode: "off", metadata: md) == nil)
+    md.replayGainTrackDB = -6.5
+    try assertEqual(ReplayGainReader.selectGain(mode: "track", metadata: md) ?? -999,
+                    Float(-6.5))
+    md.replayGainAlbumDB = -3.0
+    try assertEqual(ReplayGainReader.selectGain(mode: "album", metadata: md) ?? -999,
+                    Float(-3.0))
+    // album 模式缺 album tag → 回退 track
+    var md2 = TrackMetadata(duration: 0)
+    md2.replayGainTrackDB = -6.5
+    try assertEqual(ReplayGainReader.selectGain(mode: "album", metadata: md2) ?? -999,
+                    Float(-6.5))
+    // 无 tag → 跳过（nil），不做固定增益猜测
+    let empty = TrackMetadata(duration: 0)
+    try assertTrue(ReplayGainReader.selectGain(mode: "track", metadata: empty) == nil)
+    // 正增益 + peak → 防削波上限 = -20·log10(0.9) ≈ 0.915 dB
+    var md3 = TrackMetadata(duration: 0)
+    md3.replayGainTrackDB = 6.0
+    md3.replayGainTrackPeak = 0.9
+    let capped = ReplayGainReader.selectGain(mode: "track", metadata: md3) ?? -999
+    try assertTrue(abs(capped - Float(-20 * log10(0.9))) < 0.01,
+                   "正增益应被 peak 压到 \(String(describing: -20 * log10(0.9)))，实际 \(capped)")
+    // 负增益不受 peak 影响
+    var md4 = TrackMetadata(duration: 0)
+    md4.replayGainTrackDB = -6.0
+    md4.replayGainTrackPeak = 0.9
+    try assertEqual(ReplayGainReader.selectGain(mode: "track", metadata: md4) ?? -999,
+                    Float(-6.0))
+}
+
+runTest("signalPathMD5TagInDisplayText") {
+    let dec = AudioFormat.pcm(rate: 44100, channels: 2, bitDepth: 16)
+    var prefs = DSPPreferences()
+    prefs.bitPerfect = true
+    let chain = DSPChain.build(inputFormat: dec, preferences: prefs)
+    let dev = AudioDevice(id: 1, name: "Mock DAC", uid: "u",
+                          maxSampleRate: 96000, supportedRates: [44100])
+    let withTag = SignalPath.build(decoderFormat: dec, dspChain: chain,
+                                   outputFormat: dec, device: dev,
+                                   isHogMode: false, hardwareRateMatched: true,
+                                   md5Tag: "MD5 ✓")
+    try assertTrue(withTag.displayText.contains("MD5 ✓"))
+    try assertTrue(withTag.md5Tag == "MD5 ✓")
+    let noTag = SignalPath.build(decoderFormat: dec, dspChain: chain,
+                                 outputFormat: dec, device: dev,
+                                 isHogMode: false, hardwareRateMatched: true)
+    try assertFalse(noTag.displayText.contains("MD5"))
+    try assertTrue(noTag.md5Tag == nil)
+}
+
+#if canImport(AudioToolbox)
+runTest("flacMD5VerifyDecoderWiring") {
+    // 用 afconvert 生成真 FLAC（Apple FLAC 编码器在 STREAMINFO 写 MD5）
+    let uid = UUID().uuidString
+    let tmpDir = FileManager.default.temporaryDirectory
+    let wavURL = tmpDir.appendingPathComponent("pp_md5_\(uid).wav")
+    let flacURL = tmpDir.appendingPathComponent("pp_md5_\(uid).flac")
+    defer {
+        try? FileManager.default.removeItem(at: wavURL)
+        try? FileManager.default.removeItem(at: flacURL)
+    }
+    try WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: 8820)
+        .write(to: wavURL)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+    proc.arguments = ["-f", "flac", "-d", "flac", wavURL.path, flacURL.path]
+    try proc.run()
+    proc.waitUntilExit()
+    // 注意：Apple afconvert 对 <4608 帧（1 个 FLAC block）的输入会产出
+    // 42 字节 stub（magic 全零）且 exit 0 — 必须校验 fLaC magic
+    let flacBytes = (try? Data(contentsOf: flacURL)) ?? Data()
+    guard proc.terminationStatus == 0, flacBytes.count > 4,
+          flacBytes[0] == 0x66, flacBytes[1] == 0x4C,
+          flacBytes[2] == 0x61, flacBytes[3] == 0x43 else {
+        print("    (skipped: afconvert FLAC unavailable)")
+        return
+    }
+
+    func decodeFully(_ dec: CoreAudioDecoder) throws {
+        // 按解码器实际输出格式分配 — Apple FLAC 路径输出 float32（8 字节/帧
+        // 立体声）；旧值 8820*4 假定 int16 会堆溢出并让 MD5 读到 NaN
+        let buf = UnsafeMutableRawPointer.allocate(
+            byteCount: 8820 * dec.format.bytesPerFrame, alignment: 16)
+        defer { buf.deallocate() }
+        while !dec.isAtEnd {
+            let n = try dec.decode(into: buf, maxFrames: 8820)
+            if n == 0 { break }
+        }
+    }
+
+    // 偏好开 → 工厂路径（init(source:)）自动启用校验
+    AudioPreferences.flacMD5Verify = true
+    let dec = try CoreAudioDecoder(source: LocalFileSource(url: flacURL),
+                                   fileExtension: "flac")
+    try decodeFully(dec)
+    let parsed = (try? FLACMetadata.read(from: flacURL)) ?? nil
+    if parsed?.streamInfo.hasMD5 == true {
+        try assertEqual(dec.md5Result, CoreAudioDecoder.MD5VerificationResult.match,
+                        "偏好开启时解码到 EOF 应 MD5 匹配")
+    } else {
+        try assertEqual(dec.md5Result, CoreAudioDecoder.MD5VerificationResult.missingExpected)
+    }
+    dec.close()
+
+    // 偏好关 → 不校验
+    AudioPreferences.flacMD5Verify = false
+    let dec2 = try CoreAudioDecoder(source: LocalFileSource(url: flacURL),
+                                    fileExtension: "flac")
+    try decodeFully(dec2)
+    try assertEqual(dec2.md5Result, CoreAudioDecoder.MD5VerificationResult.notVerified)
+    dec2.close()
+
+    UserDefaults.standard.removeObject(forKey: "ppl.flacMD5Verify")   // 恢复默认开
+}
+
+runTest("playerAppliesReplayGainFromFLACTag") {
+    // 构造带 REPLAYGAIN_TRACK_GAIN vorbis comment 的真 FLAC：
+    // afconvert 生成 → 在最后一个 metadata block 后注入 VORBIS_COMMENT 块
+    func injectVorbisComment(_ data: Data, comments: [String]) -> Data {
+        var d = [UInt8](data)
+        guard d.count > 4, d[0] == 0x66, d[1] == 0x4C,
+              d[2] == 0x61, d[3] == 0x43 else { return data }
+        var pos = 4
+        var lastBlockStart = -1
+        while pos + 4 <= d.count {
+            let header = d[pos]
+            let len = (Int(d[pos + 1]) << 16) | (Int(d[pos + 2]) << 8) | Int(d[pos + 3])
+            lastBlockStart = pos
+            pos += 4 + len
+            if (header & 0x80) != 0 { break }
+        }
+        guard lastBlockStart >= 0 else { return data }
+        var body: [UInt8] = []
+        func appendLE32(_ v: Int) {
+            body += [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF),
+                     UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
+        }
+        let vendor = Array("PurePlayTest".utf8)
+        appendLE32(vendor.count); body += vendor
+        appendLE32(comments.count)
+        for c in comments {
+            let b = Array(c.utf8)
+            appendLE32(b.count); body += b
+        }
+        let bodyLen = (Int(d[lastBlockStart + 1]) << 16)
+                      | (Int(d[lastBlockStart + 2]) << 8) | Int(d[lastBlockStart + 3])
+        let insertAt = lastBlockStart + 4 + bodyLen
+        d[lastBlockStart] &= 0x7F                       // 清除旧 last 标志
+        var newBlock: [UInt8] = [0x84,                  // last | type 4 (VORBIS_COMMENT)
+                                 UInt8((body.count >> 16) & 0xFF),
+                                 UInt8((body.count >> 8) & 0xFF),
+                                 UInt8(body.count & 0xFF)]
+        newBlock += body
+        d.insert(contentsOf: newBlock, at: insertAt)
+        return Data(d)
+    }
+
+    let uid = UUID().uuidString
+    let tmpDir = FileManager.default.temporaryDirectory
+    let wavURL = tmpDir.appendingPathComponent("pp_rg_\(uid).wav")
+    let flacURL = tmpDir.appendingPathComponent("pp_rg_\(uid).flac")
+    defer {
+        try? FileManager.default.removeItem(at: wavURL)
+        try? FileManager.default.removeItem(at: flacURL)
+    }
+    // ≥4608 帧：Apple afconvert 对不足 1 个 FLAC block 的输入产出 stub（见前一测试）
+    try WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: 8820)
+        .write(to: wavURL)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+    proc.arguments = ["-f", "flac", "-d", "flac", wavURL.path, flacURL.path]
+    try proc.run()
+    proc.waitUntilExit()
+    guard proc.terminationStatus == 0,
+          let base = try? Data(contentsOf: flacURL),
+          base.count > 4, base[0] == 0x66, base[1] == 0x4C,
+          base[2] == 0x61, base[3] == 0x43 else {
+        print("    (skipped: afconvert FLAC unavailable)")
+        return
+    }
+    let tagged = injectVorbisComment(base, comments: [
+        "REPLAYGAIN_TRACK_GAIN=-6.50 dB",
+        "REPLAYGAIN_TRACK_PEAK=0.891250",
+        "REPLAYGAIN_ALBUM_GAIN=-3.00 dB",
+    ])
+    try tagged.write(to: flacURL)
+
+    // 注入后仍是合法 FLAC：元数据可读 + ExtAudioFile 可解码
+    let parsed = (try? FLACMetadata.read(from: flacURL)) ?? nil
+    try assertTrue(parsed != nil, "注入 VORBIS_COMMENT 后 FLAC 解析应成功")
+    try assertEqual(parsed?.vorbisComments["REPLAYGAIN_TRACK_GAIN"] ?? "", "-6.50 dB")
+    let md = MetadataReader.readMetadata(from: flacURL)
+    try assertTrue(md?.replayGainTrackDB != nil)
+    try assertTrue(abs((md?.replayGainTrackDB ?? 0) + 6.5) < 0.01)
+
+    // 起播接线：mode=track → GainNode 进链、bitPerfect 解除、dB 如实暴露
+    AudioPreferences.hogEnabled = false
+    AudioPreferences.replayGainMode = "track"
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)
+    try pc.playLocal(url: flacURL)
+    try assertEqual(pc.state, .playing)
+    try assertTrue(pc.lastReplayGainDB != nil)
+    try assertTrue(abs((pc.lastReplayGainDB ?? 0) + 6.5) < 0.01,
+                   "peak 0.89125 → headroom 1dB，-6.5dB 不应被压")
+    let sp = pc.currentSignalPath()
+    try assertTrue(sp?.dsp.enabledNodes.contains("Gain") == true,
+                   "GainNode 应出现在信号路径中")
+    try assertFalse(sp!.isBitPerfect)
+    pc.stop()
+
+    // mode=off → 不应用
+    AudioPreferences.replayGainMode = "off"
+    let pc2 = PlayerController(output: MockAudioOutput())
+    try pc2.playLocal(url: flacURL)
+    try assertTrue(pc2.lastReplayGainDB == nil)
+    try assertFalse(pc2.currentSignalPath()?.dsp.enabledNodes.contains("Gain") == true)
+    pc2.stop()
+}
+#endif
 
 // ═══════════════════════════════════════════════════════
 // Gapless & Schema Tests

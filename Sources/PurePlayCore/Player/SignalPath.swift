@@ -47,10 +47,14 @@ public struct SignalPath: Sendable, Equatable {
     public let dsp: DSP
     public let output: Output
 
-    public init(source: Source, dsp: DSP, output: Output) {
+    /// issue #12：FLAC MD5 校验结果标记（"MD5 ✓" / "MD5 ✗"；nil = 未校验/不适用）
+    public let md5Tag: String?
+
+    public init(source: Source, dsp: DSP, output: Output, md5Tag: String? = nil) {
         self.source = source
         self.dsp = dsp
         self.output = output
+        self.md5Tag = md5Tag
     }
 
     /// 用户可见的"信号路径文本"
@@ -64,7 +68,8 @@ public struct SignalPath: Sendable, Equatable {
         }
         let hogTag = output.isHogMode ? " Hog" : ""
         let matchTag = output.hardwareRateMatched ? " ✓" : " ⚠"
-        return "\(source.format) → \(mid) → \(output.deviceName)\(hogTag) \(output.format)\(matchTag)"
+        let md5 = md5Tag.map { " · \($0)" } ?? ""
+        return "\(source.format) → \(mid) → \(output.deviceName)\(hogTag) \(output.format)\(matchTag)\(md5)"
     }
 
     /// 真 bit-perfect 判定：DSP 全 bypass + 硬件率匹配
@@ -79,7 +84,8 @@ public struct SignalPath: Sendable, Equatable {
                              outputFormat: AudioFormat,
                              device: AudioDevice?,
                              isHogMode: Bool,
-                             hardwareRateMatched: Bool) -> SignalPath {
+                             hardwareRateMatched: Bool,
+                             md5Tag: String? = nil) -> SignalPath {
 
         let source = Source(
             format: formatSource(decoderFormat),
@@ -96,7 +102,7 @@ public struct SignalPath: Sendable, Equatable {
             hardwareRateMatched: hardwareRateMatched
         )
 
-        return SignalPath(source: source, dsp: dsp, output: output)
+        return SignalPath(source: source, dsp: dsp, output: output, md5Tag: md5Tag)
     }
 
     private static func formatSource(_ f: AudioFormat) -> String {

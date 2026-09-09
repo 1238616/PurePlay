@@ -174,13 +174,23 @@ public final class PlayerController: @unchecked Sendable {
     /// 无活跃管线时返回 nil
     public func currentSignalPath() -> SignalPath? {
         guard let p = pipeline else { return nil }
+        // issue #12：MD5 校验结果注入 SignalPath（UI 状态栏如实展示 ✓/✗）
+        var md5Tag: String? = nil
+        #if canImport(AudioToolbox)
+        switch (p.decoder as? CoreAudioDecoder)?.md5Result {
+        case .match:    md5Tag = "MD5 ✓"
+        case .mismatch: md5Tag = "MD5 ✗"
+        default:        md5Tag = nil   // notVerified / missingExpected 不展示
+        }
+        #endif
         return SignalPath.build(
             decoderFormat: p.decoder.format,
             dspChain: p.dspChain,
             outputFormat: p.outputFormat,
             device: output.currentDevice,
             isHogMode: output.isHogMode,
-            hardwareRateMatched: p.didMatchHardwareRate
+            hardwareRateMatched: p.didMatchHardwareRate,
+            md5Tag: md5Tag
         )
     }
 
@@ -252,6 +262,35 @@ public final class PlayerController: @unchecked Sendable {
         }
     }
 
+    // MARK: - ReplayGain / FLAC MD5 暴露（issue #8 / #12）
+
+    /// issue #8：本次起播实际应用的 ReplayGain（dB）；未应用为 nil。
+    /// UI 可在 NowPlaying 区域展示"RG -6.4dB"。
+    public private(set) var lastReplayGainDB: Float?
+
+    /// issue #12：当前管线解码器的 FLAC MD5 校验结果。
+    /// 非 CoreAudioDecoder（FFmpeg/DSD/WAV）或未启用校验时为 nil。
+    /// 播完后 match = 全链路解码无篡改的自证；mismatch = 文件损坏或假无损。
+    public var flacMD5Result: CoreAudioDecoder.MD5VerificationResult? {
+        #if canImport(AudioToolbox)
+        return (pipeline?.decoder as? CoreAudioDecoder)?.md5Result
+        #else
+        return nil
+        #endif
+    }
+
+    /// issue #8：ReplayGain 起播接线 — 读 tag、按模式选增益、peak 防削波。
+    /// 返回 nil 表示不应用（mode off / DSD / 无 tag / 增益为 0）。
+    /// DSD（DoP）绕过 DSP 链，GainNode 无法作用，故排除。
+    private func replayGainDB(for url: URL, isDSD: Bool) -> Float? {
+        let mode = AudioPreferences.replayGainMode
+        guard mode != "off", !isDSD else { return nil }
+        guard let md = MetadataReader.readMetadata(from: url) else { return nil }
+        guard let rg = ReplayGainReader.selectGain(mode: mode, metadata: md),
+              rg != 0 else { return nil }
+        return rg
+    }
+
     // MARK: - 统一播放入口
 
     public func play(source: TrackSource) throws {
@@ -271,8 +310,18 @@ public final class PlayerController: @unchecked Sendable {
         let ext = url.pathExtension.lowercased()
         let source = try LocalFileSource(url: url)
         // issue #10：DSD 按 DAC 能力选 DoP / DSD2PCM 回退
-        let (decoder, effectivePrefs) = try makeDecoderApplyingDSDStrategy(
+        let (decoder, basePrefs) = try makeDecoderApplyingDSDStrategy(
             source: source, fileExtension: ext)
+        var effectivePrefs = basePrefs
+        // issue #8：ReplayGain 接线 — 本地文件起播时直接读 tag
+        lastReplayGainDB = nil
+        if let rg = replayGainDB(for: url, isDSD: decoder.format.isDSD) {
+            effectivePrefs.replayGainEnabled = true
+            effectivePrefs.replayGainDB = rg
+            // 应用 ReplayGain 必然走 DSP float 链，bit-perfect 语义不再成立
+            effectivePrefs.bitPerfect = false
+            lastReplayGainDB = rg
+        }
         let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer

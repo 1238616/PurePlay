@@ -148,6 +148,34 @@ public enum AudioPreferences {
         ud.set(1, forKey: eqMigrationVersionKey)
     }
 
+    // MARK: - ReplayGain (issue #8)
+
+    private static let replayGainModeKey = "ppl.replayGainMode"
+
+    /// ReplayGain 模式："off"（默认）/ "track" / "album"。
+    /// 非法值读取时归一化为 "off"。
+    public static var replayGainMode: String {
+        get {
+            let v = UserDefaults.standard.string(forKey: replayGainModeKey) ?? "off"
+            return (v == "track" || v == "album") ? v : "off"
+        }
+        set {
+            let normalized = (newValue == "track" || newValue == "album") ? newValue : "off"
+            UserDefaults.standard.set(normalized, forKey: replayGainModeKey)
+        }
+    }
+
+    // MARK: - FLAC MD5 校验 (issue #12)
+
+    private static let flacMD5VerifyKey = "ppl.flacMD5Verify"
+
+    /// FLAC MD5 校验开关。**默认开**：key 不存在时视为 true
+    /// （bool(forKey:) 缺省返回 false，故用 object(forKey:) 区分未设置）。
+    public static var flacMD5Verify: Bool {
+        get { UserDefaults.standard.object(forKey: flacMD5VerifyKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: flacMD5VerifyKey) }
+    }
+
     // MARK: - AutoEQ 耳机型号 (E8)
 
     private static let currentHeadphoneNameKey = "ppl.currentHeadphoneName"

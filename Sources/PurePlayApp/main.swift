@@ -337,6 +337,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         audioMenu.addItem(NSMenuItem.separator())
 
+        // issue #8：ReplayGain 模式（起播下一曲时生效；无 tag 的曲目跳过）
+        let rgHeader = NSMenuItem(title: "ReplayGain (next track)", action: nil, keyEquivalent: "")
+        rgHeader.isEnabled = false
+        audioMenu.addItem(rgHeader)
+        let rgMode = AudioPreferences.replayGainMode
+        for (title, mode) in [("  Off", "off"), ("  Track", "track"), ("  Album", "album")] {
+            let item = NSMenuItem(title: title,
+                                  action: #selector(selectReplayGainMode(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode
+            item.state = (rgMode == mode) ? .on : .off
+            audioMenu.addItem(item)
+        }
+
+        // issue #12：FLAC MD5 校验开关（默认开；结果见信号路径栏 MD5 ✓/✗）
+        let md5Item = NSMenuItem(title: "FLAC MD5 Verify",
+                                 action: #selector(toggleFLACMD5Verify),
+                                 keyEquivalent: "")
+        md5Item.target = self
+        md5Item.state = AudioPreferences.flacMD5Verify ? .on : .off
+        audioMenu.addItem(md5Item)
+
+        audioMenu.addItem(NSMenuItem.separator())
+
         let statusText = audioStatusLine()
         let status = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         status.isEnabled = false
@@ -372,6 +397,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleHogMode() {
         playerController.setHogModePreference(!playerController.isHogModeEnabled)
         contentView.refreshSignalPath()
+    }
+
+    /// issue #8：切换 ReplayGain 模式（off/track/album），下一曲起播时生效
+    @objc private func selectReplayGainMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        AudioPreferences.replayGainMode = mode
+        rebuildAudioMenu()
+    }
+
+    /// issue #12：切换 FLAC MD5 校验（下一次打开解码器时生效）
+    @objc private func toggleFLACMD5Verify() {
+        AudioPreferences.flacMD5Verify.toggle()
+        rebuildAudioMenu()
     }
 
     @objc private func showWindow() {

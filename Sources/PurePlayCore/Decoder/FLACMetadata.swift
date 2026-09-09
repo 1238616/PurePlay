@@ -179,8 +179,11 @@ public final class FLACMD5Verifier {
     /// 按源 bitsPerSample 截断后写入 MD5
     public func updateInt32(_ pcm: UnsafePointer<Int32>, sampleCount: Int) {
         let bps = bitsPerSample
+        // hasFed 仅在实际喂入的分支置位（罕见位深 default 分支不喂，
+        // 防止 EOF 用空摘要比对出假 mismatch）
         switch bps {
         case 16:
+            hasFed = true
             var scratch = [UInt8](repeating: 0, count: sampleCount * 2)
             for i in 0..<sampleCount {
                 let s = pcm[i] >> 16   // int32 容器低 16 位为有效数据；CoreAudioDecoder 已左对齐至高位
@@ -192,6 +195,7 @@ public final class FLACMD5Verifier {
                 CC_MD5_Update(&context, p.baseAddress, CC_LONG(p.count))
             }
         case 24:
+            hasFed = true
             var scratch = [UInt8](repeating: 0, count: sampleCount * 3)
             for i in 0..<sampleCount {
                 let s = pcm[i] >> 8    // 24-bit 数据在 int32 容器的高 24 位
@@ -204,6 +208,7 @@ public final class FLACMD5Verifier {
                 CC_MD5_Update(&context, p.baseAddress, CC_LONG(p.count))
             }
         case 32:
+            hasFed = true
             pcm.withMemoryRebound(to: UInt8.self, capacity: sampleCount * 4) { p in
                 CC_MD5_Update(&context, p, CC_LONG(sampleCount * 4))
             }
@@ -217,8 +222,52 @@ public final class FLACMD5Verifier {
     /// int16/int24 packed）— FLAC 规范的 MD5 输入正是小端原生宽度
     /// 逐声道交错样本，字节序与容器布局一致，原始字节直接喂入
     public func updateRaw(_ bytes: UnsafeRawPointer, byteCount: Int) {
+        hasFed = true
         CC_MD5_Update(&context, bytes, CC_LONG(byteCount))
     }
+
+    /// issue #12：float32 容器输入 — Apple 的 ExtAudioFile FLAC 解码路径
+    /// 以归一化 float 投递（f = int / 2^(bps-1)）。按源位深还原成小端
+    /// 整数再喂 MD5：≤24-bit 时 float32 尾数足以精确往返（round-trip
+    /// bit-exact）；32-bit 源无法经 float32 无损还原 → 不喂（hasFed 保持
+    /// false，EOF 不做比对，避免空 MD5 假阳性）。
+    public func updateFloat(_ pcm: UnsafePointer<Float>, sampleCount: Int) {
+        switch bitsPerSample {
+        case 16:
+            var scratch = [UInt8](repeating: 0, count: sampleCount * 2)
+            for i in 0..<sampleCount {
+                let f = Double(pcm[i]) * 32768.0
+                // NaN 会穿透 Swift 的 min/max — 显式归零，避免 Int16() trap
+                let clamped = f.isFinite ? min(max(f.rounded(), -32768.0), 32767.0) : 0.0
+                let v = UInt16(bitPattern: Int16(clamped))
+                scratch[i * 2]     = UInt8(v & 0xFF)
+                scratch[i * 2 + 1] = UInt8(v >> 8)
+            }
+            hasFed = true
+            scratch.withUnsafeBufferPointer { p in
+                CC_MD5_Update(&context, p.baseAddress, CC_LONG(p.count))
+            }
+        case 24:
+            var scratch = [UInt8](repeating: 0, count: sampleCount * 3)
+            for i in 0..<sampleCount {
+                let f = Double(pcm[i]) * 8388608.0
+                let clamped = f.isFinite ? min(max(f.rounded(), -8388608.0), 8388607.0) : 0.0
+                let u = UInt32(bitPattern: Int32(clamped))
+                scratch[i * 3]     = UInt8(u & 0xFF)
+                scratch[i * 3 + 1] = UInt8((u >> 8) & 0xFF)
+                scratch[i * 3 + 2] = UInt8((u >> 16) & 0xFF)
+            }
+            hasFed = true
+            scratch.withUnsafeBufferPointer { p in
+                CC_MD5_Update(&context, p.baseAddress, CC_LONG(p.count))
+            }
+        default:
+            break   // 32-bit / 罕见位深：float 路径不可校验
+        }
+    }
+
+    /// 是否有样本真正喂入过（EOF 比对的前提 — 防止空摘要假 mismatch）
+    public private(set) var hasFed = false
 
     public func finalize() -> [UInt8] {
         var digest = [UInt8](repeating: 0, count: 16)

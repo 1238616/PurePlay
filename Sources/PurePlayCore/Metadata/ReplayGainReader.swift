@@ -64,6 +64,32 @@ enum ReplayGainReader {
         }
     }
 
+    /// issue #8：按模式挑选应用的增益（纯函数，便于单测）
+    ///
+    /// - mode "off" → nil（不启用）
+    /// - mode "album" → album gain，缺 tag 回退 track gain
+    /// - mode "track" → track gain
+    /// - 无对应 tag → nil（跳过策略，不做固定 -6dB 猜测）
+    /// - 正增益用 peak 做防削波上限：gain ≤ -20·log10(min(peak, 1))
+    static func selectGain(mode: String, metadata md: TrackMetadata) -> Float? {
+        guard mode == "track" || mode == "album" else { return nil }
+        let gain: Double?
+        let peak: Double?
+        if mode == "album" {
+            gain = md.replayGainAlbumDB ?? md.replayGainTrackDB
+            peak = md.replayGainAlbumPeak ?? md.replayGainTrackPeak
+        } else {
+            gain = md.replayGainTrackDB
+            peak = md.replayGainTrackPeak
+        }
+        guard let g = gain else { return nil }
+        var db = g
+        if let p = peak, p > 0 {
+            db = min(db, -20 * log10(min(p, 1.0)))
+        }
+        return Float(db)
+    }
+
     /// 解析 "-6.42 dB" / "+1.23" / "-1.23dB" 这类字符串
     static func parseDBValue(_ s: String) -> Double? {
         let trimmed = s.replacingOccurrences(of: "dB", with: "",

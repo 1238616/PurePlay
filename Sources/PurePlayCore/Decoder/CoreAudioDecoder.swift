@@ -179,8 +179,10 @@ public final class CoreAudioDecoder: AudioDecoder {
     /// 这是为了兼容 AudioSource 协议；对于本地文件直接用 URL 更高效
     public convenience init(source: AudioSource, fileExtension: String) throws {
         // 如果是 LocalFileSource，直接获取 URL
+        // issue #12：MD5 校验按用户偏好接线（默认开）— 结果经 md5Result 暴露
         if let localSource = source as? LocalFileSource {
-            try self.init(url: localSource.url)
+            try self.init(url: localSource.url,
+                          verifyFLACMD5: AudioPreferences.flacMD5Verify)
             return
         }
 
@@ -207,7 +209,8 @@ public final class CoreAudioDecoder: AudioDecoder {
             data.append(Data(bytes: buf, count: n))
         }
         try data.write(to: tmpFile)
-        try self.init(url: tmpFile)
+        // issue #12：临时文件路径同样按偏好启用 MD5 校验
+        try self.init(url: tmpFile, verifyFLACMD5: AudioPreferences.flacMD5Verify)
     }
 
     public func decode(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
@@ -252,28 +255,38 @@ public final class CoreAudioDecoder: AudioDecoder {
         }
         currentFrame += Int64(framesRead)
 
-        // FLAC MD5 增量更新（仅整数路径）
-        if let v = md5Verifier,
-           clientFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0,
-           framesRead > 0 {
+        // FLAC MD5 增量更新
+        // issue #12：Apple 的 ExtAudioFile FLAC 解码以 float32 容器投递 —
+        // 整数分支之外必须补 float 分支（按源位深还原小端整数再喂 MD5），
+        // 否则校验器空转、EOF 用空摘要比对出**假 mismatch**。
+        if let v = md5Verifier, framesRead > 0 {
             let sampleCount = Int(framesRead) * format.channels
-            if format.sampleFormat.bitDepth == v.bitsPerSample {
-                // issue #14：原生位深容器 — FLAC 规范的 MD5 输入正是
-                // 小端原生宽度样本，原始字节直接喂入
-                v.updateRaw(buffer, byteCount: sampleCount * format.sampleFormat.bytesPerSample)
-            } else {
-                // int32 回退容器：按源位深移位后喂 MD5（旧路径）
-                buffer.withMemoryRebound(to: Int32.self, capacity: sampleCount) { p in
-                    v.updateInt32(p, sampleCount: sampleCount)
+            if clientFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0 {
+                if format.sampleFormat.bitDepth == v.bitsPerSample {
+                    // issue #14：原生位深容器 — FLAC 规范的 MD5 输入正是
+                    // 小端原生宽度样本，原始字节直接喂入
+                    v.updateRaw(buffer, byteCount: sampleCount * format.sampleFormat.bytesPerSample)
+                } else {
+                    // int32 回退容器：按源位深移位后喂 MD5（旧路径）
+                    buffer.withMemoryRebound(to: Int32.self, capacity: sampleCount) { p in
+                        v.updateInt32(p, sampleCount: sampleCount)
+                    }
+                }
+            } else if clientFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0 {
+                buffer.withMemoryRebound(to: Float.self, capacity: sampleCount) { p in
+                    v.updateFloat(p, sampleCount: sampleCount)
                 }
             }
         }
 
-        // 到达 EOF 时一次性比对
+        // 到达 EOF 时一次性比对；hasFed=false（如 32-bit 源走 float 路径
+        // 无法还原）→ 保持 notVerified，绝不拿空摘要判 mismatch
         if isAtEnd, md5Result == .notVerified, let v = md5Verifier, let exp = expectedMD5 {
-            let actual = v.finalize()
             md5Verifier = nil
-            md5Result = (actual == exp) ? .match : .mismatch(expected: exp, actual: actual)
+            if v.hasFed {
+                let actual = v.finalize()
+                md5Result = (actual == exp) ? .match : .mismatch(expected: exp, actual: actual)
+            }
         }
 
         return Int(framesRead)
