@@ -22,6 +22,9 @@ public final class FFmpegDecoder: AudioDecoder {
 
     private var pendingBuffer: [UInt8] = []
     private var pendingOffset: Int = 0
+    /// issue #15a: swr_convert 输出复用缓冲 — 旧实现每帧新建 tempBuf
+    /// 数组（int24 再复制一遍 packed），高规格文件下 GC 压力翻倍
+    private var swrScratch: [UInt8] = []
     private let bytesPerOutputFrame: Int
 
     public init(source: AudioSource, fileExtension: String) throws {
@@ -196,12 +199,14 @@ public final class FFmpegDecoder: AudioDecoder {
         let channels = format.channels
 
         // swr_convert always writes outAVFormat: S32 (4 bytes/sample) for int24/int32, S16 for int16.
-        // Allocate for the actual swr output size, not the packed int24 size.
+        // issue #15a: 复用 swrScratch（仅容量不足时扩容）— 每帧零分配
         let bytesPerSwrSample = (format.sampleFormat == .int24) ? 4 : bytesPerOutputFrame / channels
         let swrBufSize = nbSamples * channels * bytesPerSwrSample
-        var tempBuf = [UInt8](repeating: 0, count: swrBufSize)
+        if swrScratch.count < swrBufSize {
+            swrScratch = [UInt8](repeating: 0, count: swrBufSize)
+        }
 
-        tempBuf.withUnsafeMutableBufferPointer { ptr in
+        swrScratch.withUnsafeMutableBufferPointer { ptr in
             var outBufPtr: UnsafeMutablePointer<UInt8>? = ptr.baseAddress
             withUnsafeMutablePointer(to: &outBufPtr) { outPtrPtr in
                 let srcData = frame.pointee.extended_data!
@@ -217,26 +222,32 @@ public final class FFmpegDecoder: AudioDecoder {
             }
         }
 
+        var available = swrBufSize
         if format.sampleFormat == .int24 {
-            // Repack S32 (little-endian, 24-bit value in bytes 0-2) → packed int24 (3 bytes)
-            var packed = [UInt8]()
-            packed.reserveCapacity(nbSamples * channels * 3)
-            for i in 0..<(nbSamples * channels) {
-                let offset = i * 4
-                packed.append(tempBuf[offset])
-                packed.append(tempBuf[offset + 1])
-                packed.append(tempBuf[offset + 2])
+            // issue #15a: S32（小端，24-bit 值在 byte 0-2）→ packed int24
+            // 原地前向压缩 — 写偏移 i*3 恒落后读偏移 i*4，无需第二块缓冲
+            let n = nbSamples * channels
+            swrScratch.withUnsafeMutableBufferPointer { p in
+                let base = p.baseAddress!
+                for i in 0..<n {
+                    let src = base + i * 4
+                    let dst = base + i * 3
+                    dst[0] = src[0]
+                    dst[1] = src[1]
+                    dst[2] = src[2]
+                }
             }
-            tempBuf = packed
+            available = n * 3
         }
 
-        let available = tempBuf.count
         let toCopy = min(available, maxBytes - written)
-        memcpy(outPtr + written, tempBuf, toCopy)
+        swrScratch.withUnsafeBufferPointer { p in
+            memcpy(outPtr + written, p.baseAddress!, toCopy)
+        }
         written += toCopy
 
         if toCopy < available {
-            pendingBuffer = Array(tempBuf[toCopy...])
+            pendingBuffer = Array(swrScratch[toCopy..<available])
             pendingOffset = 0
         }
     }

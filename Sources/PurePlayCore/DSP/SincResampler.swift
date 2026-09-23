@@ -80,7 +80,6 @@ public final class SincResampler {
         let zc = Self.zeroCrossings
         let phasesN = Self.phasesPerZeroCrossing
         let phasesD = Double(phasesN)
-        let coefHalf = zc * phasesN     // 每边系数数 = zc × phasesN
 
         // 复用 workBuffer（仅在容量不足时扩容）
         let totalSamples = history[0].count + inputFrames

@@ -187,25 +187,23 @@ public final class AIFFDecoder: AudioDecoder {
         let p = buffer.assumingMemoryBound(to: UInt8.self)
         switch bps {
         case 2:
+            // issue #15b: 整型指针 + byteSwapped — 编译器可矢量化，
+            // 逐字节交换循环在大帧数下是纯开销
+            let p16 = buffer.assumingMemoryBound(to: UInt16.self)
             for i in 0..<samples {
-                let a = p[i * 2]
-                p[i * 2] = p[i * 2 + 1]
-                p[i * 2 + 1] = a
+                p16[i] = p16[i].byteSwapped
             }
         case 3:
+            // 24-bit 无整型对应 — 保持首尾字节交换（中间字节不动）
             for i in 0..<samples {
                 let a = p[i * 3]
                 p[i * 3] = p[i * 3 + 2]
                 p[i * 3 + 2] = a
             }
         case 4:
+            let p32 = buffer.assumingMemoryBound(to: UInt32.self)
             for i in 0..<samples {
-                let a = p[i * 4]
-                let b = p[i * 4 + 1]
-                p[i * 4] = p[i * 4 + 3]
-                p[i * 4 + 1] = p[i * 4 + 2]
-                p[i * 4 + 2] = b
-                p[i * 4 + 3] = a
+                p32[i] = p32[i].byteSwapped
             }
         default: break
         }
