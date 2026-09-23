@@ -56,7 +56,9 @@ public final class DSPChain {
         }
 
         if preferences.crossfeedEnabled && inputFormat.channels == 2 {
-            nodes.append(CrossfeedNode(intensity: preferences.crossfeedIntensity))
+            nodes.append(CrossfeedNode(
+                intensity: preferences.crossfeedIntensity,
+                preset: BS2BPreset.fromConfig(preferences.crossfeedPreset)))
         }
 
         // issue #9：dither 不再挂在 float 链中 — 量化噪声整形必须发生在
@@ -114,6 +116,9 @@ public struct DSPPreferences: Sendable {
 
     public var crossfeedEnabled: Bool = false
     public var crossfeedIntensity: Float = 0.5
+    /// BS2B 预设名（issue #17-3）："default"(700Hz/4.5dB) /
+    /// "cmoy"(700Hz/6dB) / "jmeier"(650Hz/9.5dB)。未知值归一化为 default。
+    public var crossfeedPreset: String = "default"
 
     /// TPDF dither — 由 PCMOutputConverter 在 float → 整数量化点施加（issue #9）
     public var ditherEnabled: Bool = false

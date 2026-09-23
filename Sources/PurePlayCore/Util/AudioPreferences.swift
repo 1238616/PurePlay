@@ -165,6 +165,24 @@ public enum AudioPreferences {
         }
     }
 
+    // MARK: - 上采样 (issue #17)
+
+    private static let upsamplingModeKey = "ppl.upsamplingMode"
+
+    /// 倍率上采样模式："off"（默认，源率直通）/ "x2" / "x4" / "deviceMax"。
+    /// 部分 DAC 在高采样率下数字滤波器工作更从容 — SincResampler 接线
+    /// （issue #5）后由 AudioPipeline 变长路径执行。非法值归一化为 "off"。
+    public static var upsamplingMode: String {
+        get {
+            let v = UserDefaults.standard.string(forKey: upsamplingModeKey) ?? "off"
+            return ["off", "x2", "x4", "deviceMax"].contains(v) ? v : "off"
+        }
+        set {
+            let normalized = ["off", "x2", "x4", "deviceMax"].contains(newValue) ? newValue : "off"
+            UserDefaults.standard.set(normalized, forKey: upsamplingModeKey)
+        }
+    }
+
     // MARK: - FLAC MD5 校验 (issue #12)
 
     private static let flacMD5VerifyKey = "ppl.flacMD5Verify"

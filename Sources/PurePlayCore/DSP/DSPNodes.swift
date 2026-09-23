@@ -464,86 +464,166 @@ public final class DitherNode: DSPNode {
     }
 }
 
-/// BS2B-style Crossfeed (Meier 简化版本)
-/// 单极一阶 IIR 低通 (≈700Hz) + 对侧注入 + 直通衰减保能量
-/// intensity ∈ [0, 1] 对应 cross level 0..-4.5dB（线性 0..0.595）
+/// libbs2b 官方预设（issue #17-3）
+///
+/// fcutHz / feedX10 直接对应 Boris Mikhaylov libbs2b 的
+/// BS2B_DEFAULT_CLEVEL / BS2B_CMOY_CLEVEL / BS2B_JMEIER_CLEVEL
+/// （level = feedX10 << 16 | fcutHz）。
+public struct BS2BPreset: Equatable, Sendable {
+    public let name: String
+    /// 低通截止频率 Hz（官方合法范围 300...2000）
+    public let fcutHz: Int
+    /// 馈送电平，0.1 dB 单位（官方合法范围 10...150）
+    public let feedX10: Int
+
+    /// libbs2b BS2B_MINFEED = 10（1.0 dB）— intensity 缩放下限
+    public static let minFeedX10 = 10
+
+    public init(name: String, fcutHz: Int, feedX10: Int) {
+        self.name = name
+        self.fcutHz = fcutHz
+        self.feedX10 = feedX10
+    }
+
+    /// 官方 BS2B_DEFAULT_CLEVEL：700 Hz，4.5 dB
+    public static let standard = BS2BPreset(name: "Default", fcutHz: 700, feedX10: 45)
+    /// 官方 BS2B_CMOY_CLEVEL：700 Hz，6.0 dB（Chu Moy 经典耳机）
+    public static let chuMoy = BS2BPreset(name: "Chu Moy", fcutHz: 700, feedX10: 60)
+    /// 官方 BS2B_JMEIER_CLEVEL：650 Hz，9.5 dB（Jan Meier）
+    public static let janMeier = BS2BPreset(name: "Jan Meier", fcutHz: 650, feedX10: 95)
+
+    /// 配置字符串（"default"/"cmoy"/"jmeier"）→ 预设；未知值归一化为 standard
+    public static func fromConfig(_ s: String) -> BS2BPreset {
+        switch s {
+        case "cmoy":   return .chuMoy
+        case "jmeier": return .janMeier
+        default:       return .standard
+        }
+    }
+}
+
+/// BS2B Crossfeed — Boris Mikhaylov libbs2b 原始算法移植（issue #17-3）
+///
+/// 取代旧的"Meier 简化版"（单低通 + 能量守恒混合）。官方算法对每声道
+/// 并联两条一阶 IIR：
+/// - Lowpass    lo[n] = a0_lo·x[n] + b1_lo·lo[n-1]              （对侧低频注入）
+/// - Highboost  hi[n] = a0_hi·x[n] + a1_hi·x[n-1] + b1_hi·hi[n-1]（本声道高频保留）
+/// - out[L] = (hi[L] + lo[R])·gain，out[R] = (hi[R] + lo[L])·gain
+///
+/// 系数按 libbs2b init() 精确公式从 (fcut, feed) 推导：
+///   GB_lo = feed·(-5/6) − 3 dB；GB_hi = feed/6 − 3 dB
+///   G_lo = 10^(GB_lo/20)；G_hi = 1 − 10^(GB_hi/20)
+///   Fc_hi = fcut·2^((GB_lo − 20·log10(G_hi))/12)
+///   x = exp(−2π·Fc/srate)；b1_lo = b1_hi 各自取 x；
+///   a0_lo = G_lo·(1−x_lo)；a0_hi = 1 − G_hi·(1−x_hi)；a1_hi = −x_hi
+///   gain = 1/(1 − G_hi + G_lo)（低音补偿 — DC 处总增益精确为 1）
+///
+/// intensity ∈ [0,1]：0 = 旁通；>0 时 feed 电平从官方 MINFEED(1.0 dB) 线性
+/// 缩放到 preset.feedX10 — intensity = 1 即精确等于官方预设参数。
 public final class CrossfeedNode: DSPNode {
     public var isEnabled: Bool = true
     public let name = "Crossfeed"
     public var intensity: Float {
-        didSet { recomputeMix() }
+        didSet { recomputeCoefficients() }
     }
-
-    /// 低通截止（Hz）— 模拟头部高频阴影
-    public let cutoffHz: Double = 700.0
+    public var preset: BS2BPreset {
+        didSet { recomputeCoefficients() }
+    }
 
     private var sampleRate: Double = 44100
     private var channels: Int = 2
+    private var bypass: Bool = true
 
-    // IIR 低通：y[n] = (1-a) * x[n] + a * y[n-1]
-    private var lpA: Float = 0   // = exp(-2π·cutoff/SR)
-    private var lpOneMinusA: Float = 1
-    private var lpStateL: Float = 0
-    private var lpStateR: Float = 0
+    // libbs2b 系数
+    private var a0Lo: Float = 0
+    private var b1Lo: Float = 0
+    private var a0Hi: Float = 1
+    private var a1Hi: Float = 0
+    private var b1Hi: Float = 0
+    private var gain: Float = 1
+    // 每声道滤波器状态：lo / hi / asis（前一输入样本，hi 滤波器 a1 项用）
+    private var loState = [Float](repeating: 0, count: 2)
+    private var hiState = [Float](repeating: 0, count: 2)
+    private var asisState = [Float](repeating: 0, count: 2)
 
-    // 混音系数
-    private var crossGain: Float = 0
-    private var directGain: Float = 1
-
-    public init(intensity: Float) {
+    public init(intensity: Float, preset: BS2BPreset = .standard) {
         self.intensity = max(0, min(1, intensity))
-        recomputeMix()
+        self.preset = preset
+        recomputeCoefficients()
     }
 
     public func configure(inputFormat: AudioFormat) -> AudioFormat {
         sampleRate = inputFormat.sampleRate
         channels = inputFormat.channels
-        let omega = 2.0 * .pi * cutoffHz / sampleRate
-        let a = exp(-omega)
-        lpA = Float(a)
-        lpOneMinusA = Float(1.0 - a)
-        lpStateL = 0
-        lpStateR = 0
+        for i in 0..<2 { loState[i] = 0; hiState[i] = 0; asisState[i] = 0 }
+        recomputeCoefficients()
         return inputFormat
     }
 
-    private func recomputeMix() {
-        // intensity 0..1 映射到 cross level 0..0.595（≈-4.5dB）
-        let cross = Float(intensity) * 0.595
-        crossGain = cross
-        // 保持总能量恒定：directGain² + crossGain² = 1
-        directGain = (cross >= 1) ? 0 : sqrt(1 - cross * cross)
+    private func recomputeCoefficients() {
+        bypass = (intensity <= 0) || channels != 2 || sampleRate < 1
+        guard !bypass else { return }
+
+        // feed 由 intensity 缩放：官方 MINFEED(1.0 dB) → preset.feedX10
+        let minFeed = Double(BS2BPreset.minFeedX10)
+        let feedX10 = (minFeed + Double(intensity) * Double(preset.feedX10) - minFeed * Double(intensity))
+        let feed = feedX10 / 10.0
+
+        let gbLo = feed * -5.0 / 6.0 - 3.0
+        let gbHi = feed / 6.0 - 3.0
+        let gLo = pow(10.0, gbLo / 20.0)
+        let gHi = 1.0 - pow(10.0, gbHi / 20.0)
+        let fcLo = Double(preset.fcutHz)
+        let fcHi = fcLo * pow(2.0, (gbLo - 20.0 * log10(gHi)) / 12.0)
+
+        let xLo = exp(-2.0 * Double.pi * fcLo / sampleRate)
+        b1Lo = Float(xLo)
+        a0Lo = Float(gLo * (1.0 - xLo))
+
+        let xHi = exp(-2.0 * Double.pi * fcHi / sampleRate)
+        b1Hi = Float(xHi)
+        a0Hi = Float(1.0 - gHi * (1.0 - xHi))
+        a1Hi = Float(-xHi)
+
+        gain = Float(1.0 / (1.0 - gHi + gLo))
     }
 
     public func process(input: UnsafePointer<Float>,
                         output: UnsafeMutablePointer<Float>,
                         frameCount: Int) {
-        guard channels == 2 else {
-            // mono：直通
+        if bypass || channels != 2 {
+            // 旁通 / mono：直通
             if input != UnsafePointer(output) {
                 memcpy(output, input, frameCount * MemoryLayout<Float>.size)
             }
             return
         }
         let stereoFrames = frameCount / 2
-        let oma = lpOneMinusA
-        let a = lpA
-        var lpL = lpStateL
-        var lpR = lpStateR
-        let dg = directGain
-        let cg = crossGain
+        let a0lo = a0Lo, b1lo = b1Lo
+        let a0hi = a0Hi, a1hi = a1Hi, b1hi = b1Hi
+        let g = gain
+        var loL = loState[0], loR = loState[1]
+        var hiL = hiState[0], hiR = hiState[1]
+        var asL = asisState[0], asR = asisState[1]
 
         for i in 0..<stereoFrames {
             let l = input[i * 2]
             let r = input[i * 2 + 1]
-            // 单极一阶 IIR 低通
-            lpL = oma * l + a * lpL
-            lpR = oma * r + a * lpR
-            // 直通（保留全频）+ 对侧低通（仅注入低中频）
-            output[i * 2]     = dg * l + cg * lpR
-            output[i * 2 + 1] = dg * r + cg * lpL
+            // Lowpass：对侧低频注入源
+            let nloL = a0lo * l + b1lo * loL
+            let nloR = a0lo * r + b1lo * loR
+            // Highboost：本声道高频保留（a1 项用上一输入样本）
+            let nhiL = a0hi * l + a1hi * asL + b1hi * hiL
+            let nhiR = a0hi * r + a1hi * asR + b1hi * hiR
+            loL = nloL; loR = nloR
+            hiL = nhiL; hiR = nhiR
+            asL = l; asR = r
+            // Crossfeed 混合 + 低音补偿
+            output[i * 2]     = (nhiL + nloR) * g
+            output[i * 2 + 1] = (nhiR + nloL) * g
         }
-        lpStateL = lpL
-        lpStateR = lpR
+        loState[0] = loL; loState[1] = loR
+        hiState[0] = hiL; hiState[1] = hiR
+        asisState[0] = asL; asisState[1] = asR
     }
 }

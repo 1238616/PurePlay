@@ -352,6 +352,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             audioMenu.addItem(item)
         }
 
+        audioMenu.addItem(NSMenuItem.separator())
+
+        // issue #17：倍率上采样（下一曲起播时生效；DSD/DoP 自动跳过）
+        let upHeader = NSMenuItem(title: "Upsampling (next track)", action: nil, keyEquivalent: "")
+        upHeader.isEnabled = false
+        audioMenu.addItem(upHeader)
+        let upMode = AudioPreferences.upsamplingMode
+        for (title, mode) in [("  Source rate (off)", "off"),
+                              ("  ×2", "x2"),
+                              ("  ×4", "x4"),
+                              ("  Device max", "deviceMax")] {
+            let item = NSMenuItem(title: title,
+                                  action: #selector(selectUpsamplingMode(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode
+            item.state = (upMode == mode) ? .on : .off
+            audioMenu.addItem(item)
+        }
+
+        audioMenu.addItem(NSMenuItem.separator())
+
         // issue #12：FLAC MD5 校验开关（默认开；结果见信号路径栏 MD5 ✓/✗）
         let md5Item = NSMenuItem(title: "FLAC MD5 Verify",
                                  action: #selector(toggleFLACMD5Verify),
@@ -403,6 +425,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectReplayGainMode(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? String else { return }
         AudioPreferences.replayGainMode = mode
+        rebuildAudioMenu()
+    }
+
+    /// issue #17：切换上采样模式（off/x2/x4/deviceMax），下一曲起播时生效
+    @objc private func selectUpsamplingMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        AudioPreferences.upsamplingMode = mode
         rebuildAudioMenu()
     }
 

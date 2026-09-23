@@ -279,6 +279,36 @@ public final class PlayerController: @unchecked Sendable {
         #endif
     }
 
+    /// issue #17：倍率上采样目标率。返回 nil 表示不上采样：
+    /// mode off / DSD（DoP 重采样会损毁 0x05/0xFA 标记字节）/
+    /// deviceMax 但设备未知或无提升空间。
+    private func upsamplingTargetRate(sourceRate: Double, isDSD: Bool) -> Double? {
+        guard !isDSD else { return nil }
+        switch AudioPreferences.upsamplingMode {
+        case "x2":
+            return sourceRate * 2
+        case "x4":
+            return sourceRate * 4
+        case "deviceMax":
+            guard let device = output.currentDevice else { return nil }
+            let maxRate = DACCapabilityProbe.probe(device).maxPCMRate
+            return maxRate > sourceRate + 0.5 ? maxRate : nil
+        default:
+            return nil
+        }
+    }
+
+    /// issue #17：把上采样偏好应用到起播 prefs。
+    /// 已在其它路径（DSD PCM 回退）设置了 resamplerTargetRate 时不覆盖。
+    private func applyUpsamplingPreference(to prefs: inout DSPPreferences, decoderFormat: AudioFormat) {
+        guard prefs.resamplerTargetRate == nil,
+              let target = upsamplingTargetRate(sourceRate: decoderFormat.sampleRate,
+                                                isDSD: decoderFormat.isDSD) else { return }
+        prefs.resamplerTargetRate = target
+        // 重采样必然改变样本流 — bit-perfect 语义不再成立
+        prefs.bitPerfect = false
+    }
+
     /// issue #8：ReplayGain 起播接线 — 读 tag、按模式选增益、peak 防削波。
     /// 返回 nil 表示不应用（mode off / DSD / 无 tag / 增益为 0）。
     /// DSD（DoP）绕过 DSP 链，GainNode 无法作用，故排除。
@@ -351,6 +381,8 @@ public final class PlayerController: @unchecked Sendable {
             effectivePrefs.bitPerfect = false
             lastReplayGainDB = rg
         }
+        // issue #17：倍率上采样（源率直通 / ×2 / ×4 / 设备最高率）
+        applyUpsamplingPreference(to: &effectivePrefs, decoderFormat: decoder.format)
         let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
@@ -373,8 +405,11 @@ public final class PlayerController: @unchecked Sendable {
         guard state == .buffering else { return }
 
         // issue #10：DSD 按 DAC 能力选 DoP / DSD2PCM 回退
-        let (decoder, effectivePrefs) = try makeDecoderApplyingDSDStrategy(
+        let (decoder, basePrefs) = try makeDecoderApplyingDSDStrategy(
             source: cloudSource, fileExtension: fileExtension)
+        var effectivePrefs = basePrefs
+        // issue #17：倍率上采样（云端与本地一致）
+        applyUpsamplingPreference(to: &effectivePrefs, decoderFormat: decoder.format)
         let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
