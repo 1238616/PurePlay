@@ -52,6 +52,16 @@ if [ ! -d "$FFMPEG_DIR/lib" ] || [ ! -d "$FFMPEG_DIR/include" ]; then
     "$ROOT/scripts/build_ffmpeg.sh"
 fi
 
+# -----------------------------------------------------------------
+# Ensure libFLAC is built (issue #13 — without these flags the whole
+# CFLAC-dependent source region is compiled out by canImport)
+# -----------------------------------------------------------------
+FLAC_DIR="$ROOT/Frameworks/libFLAC"
+if [ ! -d "$FLAC_DIR/lib" ] || [ ! -d "$FLAC_DIR/include" ]; then
+    echo "==> libFLAC not found, building..."
+    "$ROOT/scripts/build_libflac.sh"
+fi
+
 echo "==> swift build -c release"
 BUILD_FLAGS=()
 if [ -d "$FFMPEG_DIR/lib" ] && [ -d "$FFMPEG_DIR/include" ]; then
@@ -64,6 +74,16 @@ if [ -d "$FFMPEG_DIR/lib" ] && [ -d "$FFMPEG_DIR/include" ]; then
         -Xlinker -L"$FFMPEG_DIR/lib"
         -Xlinker -lavcodec -Xlinker -lavformat -Xlinker -lavutil -Xlinker -lswresample
         -Xlinker -rpath -Xlinker @executable_path/../Frameworks
+    )
+fi
+if [ -d "$FLAC_DIR/lib" ] && [ -d "$FLAC_DIR/include" ]; then
+    echo "    (with native libFLAC support)"
+    BUILD_FLAGS+=(
+        -Xcc -I"$FLAC_DIR/include"
+        -Xcc -fmodule-map-file="$ROOT/Modules/CFLAC/module.modulemap"
+        -Xswiftc -Xcc -Xswiftc -I"$FLAC_DIR/include"
+        -Xswiftc -Xcc -Xswiftc -fmodule-map-file="$ROOT/Modules/CFLAC/module.modulemap"
+        -Xlinker -L"$FLAC_DIR/lib"
     )
 fi
 swift build -c release --product PurePlay "${BUILD_FLAGS[@]}"
