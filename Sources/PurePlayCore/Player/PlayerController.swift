@@ -82,7 +82,7 @@ public final class PlayerController: @unchecked Sendable {
     /// 供 UI/日志观察云盘流播的网络抖动
     public var underrunCount: Int { pipeline?.underrunCount ?? 0 }
 
-    private var pipeline: AudioPipeline?
+    var pipeline: AudioPipeline?
     private let output: AudioOutputBackend
     public var dspPreferences: DSPPreferences
 
@@ -383,6 +383,9 @@ public final class PlayerController: @unchecked Sendable {
         }
         // issue #17：倍率上采样（源率直通 / ×2 / ×4 / 设备最高率）
         applyUpsamplingPreference(to: &effectivePrefs, decoderFormat: decoder.format)
+        // 控制面板音量：滑杆不在 100% 时强制走 DSP float 路径，软件音量才生效。
+        // 音量 = 100% 时才保留真 bit-perfect（unity 增益 + 空链直通，issue #1）。
+        if volume < 1.0 { effectivePrefs.bitPerfect = false }
         let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
@@ -410,6 +413,7 @@ public final class PlayerController: @unchecked Sendable {
         var effectivePrefs = basePrefs
         // issue #17：倍率上采样（云端与本地一致）
         applyUpsamplingPreference(to: &effectivePrefs, decoderFormat: decoder.format)
+        if volume < 1.0 { effectivePrefs.bitPerfect = false }
         let pipe = AudioPipeline(decoder: decoder, output: output, dspPreferences: effectivePrefs)
         pipe.spectrumAnalyzer = spectrumAnalyzer
         pipe.waveformBuffer = waveformBuffer
@@ -493,23 +497,58 @@ public final class PlayerController: @unchecked Sendable {
         }
     }
 
+    /// 当前管线是否处于真 bit-perfect 直通（空 DSP 链 + 无重采样）：
+    /// 此时软件音量不被读取，滑杆移动需重建管线才会生效。
+    private var pipelineIsBitPerfectDirect: Bool {
+        guard let p = pipeline else { return false }
+        return p.dspChain.isBypass && p.resampler == nil
+    }
+
     /// 设置音量（滑杆位置 0...1）。
     /// 实际增益经 VolumeCurve 感知 dB 映射（issue #17），
     /// 并只应用在 DSP float 域 — 见 applyVolumeToPipeline（issue #1）。
     public func setVolume(_ newVolume: Float) {
+        let old = volume
         volume = max(0.0, min(1.0, newVolume))
+        // 从 100%（真 bit-perfect）降到 <100%：当前管线不读软件音量，
+        // 必须重建为 DSP float 路径音量才生效。
+        if old >= 1.0 && volume < 1.0, pipelineIsBitPerfectDirect, state == .playing {
+            restartCurrentTrack()
+            return
+        }
         applyVolumeToPipeline()
     }
 
-    /// 当前生效的线性增益（bit-perfect 下恒为 1.0）
+    /// 停止并以当前音量重建当前曲目管线（音量滑杆越过 bit-perfect 边界时用）。
+    /// 本地曲目同步重建；云盘曲目需外部异步恢复（不在此重建）。
+    private func restartCurrentTrack() {
+        let idx = currentTrackIndex
+        guard idx >= 0, idx < queue.count else { return }
+        let track = queue[idx]
+        switch track {
+        case .local(let url):
+            try? playLocal(url: url)
+        case .cloud:
+            // 云盘需要 async cloudSourceFactory；无法在此同步重建。
+            // 由于 playCloud 起播时已按 volume<1.0 强制 float 路径，
+            // 云盘曲目通常不会以 bit-perfect 直通运行，此处仅透传。
+            applyVolumeToPipeline()
+        }
+    }
+
+    /// 当前生效的线性增益。
+    /// 音量只作用在 DSP float 域（issue #1）：管线里 `applyVolume` 仅在
+    /// float 路径（DSP 非 bypass 或有重采样）被调用 — 真 bit-perfect 直通
+    /// 时该值不会被读取，ring 仍得到未触碰的原始字节，bit-perfect/DoP 语义
+    /// 不受影响。因此这里始终返回滑杆映射的曲线增益，避免上采样 / ReplayGain
+    /// / DSD→PCM 回退等"有效偏好非 bit-perfect"场景下音量失效。
     public var effectiveVolumeGain: Float {
-        dspPreferences.bitPerfect ? 1.0 : VolumeCurve.linearGain(slider: volume)
+        VolumeCurve.linearGain(slider: volume)
     }
 
     /// 把音量应用到当前管线的 DSP float 域。
-    /// bit-perfect 模式下音量固定 unity — HAL 数字增益会破坏 bit-perfect，
-    /// 且 DoP 时会损毁 0x05/0xFA 标记字节导致 DAC 失锁（issue #1）；
-    /// 用户应通过功放 / DAC / 系统输出调节音量。
+    /// 真 bit-perfect 直通路径下该值被忽略（float 路径未激活），
+    /// HAL 数字增益 / DoP 标记字节均不受触碰（issue #1）。
     private func applyVolumeToPipeline() {
         guard let pipe = pipeline else { return }
         pipe.setVolume(linearGain: effectiveVolumeGain)
@@ -649,28 +688,32 @@ public final class PlayerController: @unchecked Sendable {
         endDetectionTimer?.invalidate()
         decoderEndedRingSnapshot = -1
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if let pipe = self.pipeline, pipe.decoder.isAtEnd {
-                let ringAvail = pipe.ringBuffer.availableToRead
-                if ringAvail > 0 {
-                    if self.decoderEndedRingSnapshot < 0 {
-                        self.decoderEndedRingSnapshot = ringAvail
-                    } else if ringAvail >= self.decoderEndedRingSnapshot {
-                        // Ring not draining — output likely dead, don't wait forever
-                    } else {
-                        self.decoderEndedRingSnapshot = ringAvail
-                        return
-                    }
-                }
+            guard let self, let pipe = self.pipeline, pipe.decoder.isAtEnd else { return }
+            let ringAvail = pipe.ringBuffer.availableToRead
+            let bpf = max(1, pipe.outputFormat.bytesPerFrame)
+            let rate = max(1.0, pipe.outputFormat.sampleRate)
+            // ring 里还排着旧曲尾部：先尝试无缝衔接（swap 不重置 ring，
+            // 新曲排在尾部之后 = 真正 gapless），否则等到真正的曲尾。
+            // 立即触发 onTrackFinished 会让上层 stop() 重置 ring，切掉尾部音频。
+            let tailLimit = Int(0.05 * rate * Double(bpf))
+            if ringAvail > tailLimit {
                 if self.tryGaplessAdvance() {
                     self.decoderEndedRingSnapshot = -1
                     return
                 }
-                self.endDetectionTimer?.invalidate()
-                self.endDetectionTimer = nil
+                if self.decoderEndedRingSnapshot < 0 || ringAvail < self.decoderEndedRingSnapshot {
+                    self.decoderEndedRingSnapshot = ringAvail
+                    return   // 仍在排空 — 继续等
+                }
+                // ring 不再减少：输出回调可能已失效，不再无限等待
+            } else if self.tryGaplessAdvance() {
                 self.decoderEndedRingSnapshot = -1
-                self.onTrackFinished?()
+                return
             }
+            self.endDetectionTimer?.invalidate()
+            self.endDetectionTimer = nil
+            self.decoderEndedRingSnapshot = -1
+            self.onTrackFinished?()
         }
         // Explicitly attach to the main RunLoop. playCloud() is async and may
         // resume on the cooperative thread pool where no RunLoop runs, which

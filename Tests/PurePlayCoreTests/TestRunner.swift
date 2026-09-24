@@ -2112,6 +2112,51 @@ runTest("coreAudioDecoderReportsSourceBitDepth16") {
     decoder.close()
 }
 
+runTest("coreAudioEOFLifecycle") {
+    // issue #5: Apple 的 FLAC 解码器产出的帧数恒少于 FileLengthFrames
+    // 标称值（尾部 gap），旧 isAtEnd = currentFrame >= totalFrames 会卡在
+    // 永假 → 不自动切歌。修复以 ExtAudioFileRead 返回 < 请求数（EOF）为准
+    // 置位 reachedEndOfStream。此用例验证 EOF 生命周期：消费到逻辑末尾后
+    // isAtEnd 必须为真，且 seek 回退会清除 EOS 标志、可重新续播。
+    let frames = 8820
+    let wavData = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: frames)
+    let tmpFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pureplay_eol_\(UUID().uuidString).wav")
+    try wavData.write(to: tmpFile)
+    defer { try? FileManager.default.removeItem(at: tmpFile) }
+
+    let decoder = try CoreAudioDecoder(url: tmpFile)
+    try assertFalse(decoder.isAtEnd, "开局不应处于末尾")
+    try assertEqual(decoder.currentFrame, 0)
+
+    // 分块消费到逻辑末尾（request 超出剩余帧也是合法路径，不得返回多余帧）
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: frames * 8, alignment: 16)
+    defer { buf.deallocate() }
+    var consumed = 0
+    while !decoder.isAtEnd && consumed < frames * 2 {
+        let want = 4096
+        let got = try decoder.decode(into: buf, maxFrames: want)
+        if got == 0 { break }
+        consumed += got
+        try assertLessThanOrEqual(consumed, frames)
+    }
+    try assertEqual(consumed, frames, "全量帧应被消费")
+    try assertTrue(decoder.isAtEnd, "消费到逻辑末尾后 isAtEnd 必须为真")
+    try assertEqual(decoder.currentFrame, Int64(frames))
+
+    // EOS 之后再读必须返回 0
+    let again = try decoder.decode(into: buf, maxFrames: 4096)
+    try assertEqual(again, 0, "EOS 后继续 decode 应返回 0")
+
+    // seek 回退必须清除 EOS 标志并可续播
+    try decoder.seek(to: 4410)
+    try assertFalse(decoder.isAtEnd, "seek 后必须清除 EOF 标志")
+    let resume = try decoder.decode(into: buf, maxFrames: frames)
+    try assertEqual(resume, 4410, "seek 后应能续播剩余帧")
+    try assertTrue(decoder.isAtEnd)
+    decoder.close()
+}
+
 // ─── issue #6: MP3 Xing/LAME encoder delay & padding parser ───
 
 /// 合成 MP3 首帧 + Xing/Info tag（含 LAME 魔数与 delay/padding 字段）。
@@ -3761,6 +3806,36 @@ runTest("sincResamplerReset") {
     try assertGreaterThan(produced, 0)
 }
 
+runTest("sincResamplerContinuousNoFrameLoss") {
+    // task #7 regression：跨多个 chunk 连续流不得累积丢帧。
+    // 旧实现每块相位错位，输出比理论期望低 ~0.9%，导致 ring 欠载 → 突然变小。
+    // 期望：累计输出帧数 ≈ 理论期望（误差 ≤ 每块 1 帧的舍入余量）。
+    let inRate = 192000.0, outRate = 44100.0, ch = 2
+    let resampler = SincResampler(inputRate: inRate, outputRate: outRate, channels: ch)
+    let inFrames = 4096
+    let input = UnsafeMutablePointer<Float>.allocate(capacity: inFrames * ch)
+    let outCap = resampler.estimatedOutputFrames(forInputFrames: inFrames)
+    let output = UnsafeMutablePointer<Float>.allocate(capacity: outCap * ch)
+    defer { input.deallocate(); output.deallocate() }
+    for i in 0..<inFrames * ch { input[i] = sin(Float(i) * 0.03) }
+
+    let chunks = 500
+    var totalOut = 0
+    var sawCap = false
+    for _ in 0..<chunks {
+        let n = resampler.process(input: input, inputFrames: inFrames,
+                                  output: output, outputCapacityFrames: outCap)
+        totalOut += n
+        if n >= outCap { sawCap = true }
+    }
+    // 理论期望：inFrames * (outRate/inRate) * chunks
+    let expTotal = Double(inFrames) * (outRate / inRate) * Double(chunks)
+    // 舍入余量：每块最多半帧 + 常数；允许 ≤ chunks/2 + 2
+    try assertLessThan(abs(Double(totalOut) - expTotal), Double(chunks) / 2 + 2)
+    // 不应贴住容量上限（那说明输出被截断）
+    try assertFalse(sawCap, "resampler hit capacity ceiling => output truncated")
+}
+
 // ═══════════════════════════════════════════════════════
 // DSD2PCM Converter Tests
 // ═══════════════════════════════════════════════════════
@@ -4988,11 +5063,15 @@ runTest("volumeCurveMonotonic") {
     }
 }
 
-runTest("playerControllerVolumeBitPerfectStaysUnity") {
+runTest("playerControllerVolumeReportsCurveGainRegardlessOfBitPerfect") {
     let out = MockAudioOutput()
     let pc = PlayerController(output: out)              // 默认 bitPerfect = true
     pc.setVolume(0.3)
-    try assertEqualFloat(pc.effectiveVolumeGain, 1.0, accuracy: 0)
+    // 音量只作用在 DSP float 域；真 bit-perfect 直通时管线不读取该增益，
+    // 因此 effectiveVolumeGain 恒返回滑杆曲线增益（否则上采样/ReplayGain
+    // /DSD→PCM 回退等有效偏好非 bit-perfect 场景下音量会失效）。
+    try assertEqualFloat(pc.effectiveVolumeGain,
+                         VolumeCurve.linearGain(slider: 0.3), accuracy: 1e-6)
 
     var prefs = DSPPreferences()
     prefs.bitPerfect = false
@@ -5054,6 +5133,39 @@ runTest("pipelineBitPerfectIgnoresVolume") {
     try assertEqual(Data(bytes: buf, count: byteCount), original,
                     "bit-perfect 路径不得应用任何增益（DoP 标记字节依赖此保证）")
     pipe.stop()
+}
+
+runTest("playerControllerForcesFloatPathWhenVolumeBelowMax") {
+    let frames = 4410
+    let wav = WAVTestHelper.makePCM16Stereo(sampleRate: 44100, durationFrames: frames)
+    let tmpFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pureplay_vol_\(UUID().uuidString).wav")
+    try wav.write(to: tmpFile)
+    defer { try? FileManager.default.removeItem(at: tmpFile) }
+
+    // 音量 = 100% → 保留真 bit-perfect（空 DSP 链，软件音量不读）
+    let outFull = MockAudioOutput()
+    let pcFull = PlayerController(output: outFull)
+    pcFull.setVolume(1.0)
+    try pcFull.playLocal(url: tmpFile)
+    try assertTrue(pcFull.pipeline?.dspChain.isBypass ?? false,
+                   "音量 100% 时应保持 bit-perfect 空链")
+    try assertTrue(pcFull.pipeline?.resampler == nil, "音量 100% 时不应强制重采样")
+    pcFull.stop()
+
+    // 音量 < 100% → 强制 DSP float 路径（bitPerfect=false），软件音量才生效
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)
+    pc.setVolume(0.5)
+    try pc.playLocal(url: tmpFile)
+    let pipe = pc.pipeline!
+    try assertFalse(pipe.dspChain.isBypass,
+                    "音量 <100% 时必须激活 DSP float 路径")
+    // 音量必须经曲线映射并已写入管线（非 unity）
+    let expected = VolumeCurve.linearGain(slider: 0.5)
+    try assertEqualFloat(pc.effectiveVolumeGain, expected, accuracy: 1e-6)
+    try assertEqualFloat(pipe.volumeGain, expected, accuracy: 1e-6)
+    pc.stop()
 }
 
 // ═══════════════════════════════════════════════════════
@@ -5993,6 +6105,248 @@ runTest("timerOnCooperativePoolNeedsExplicitMainRunLoop") {
     try assertGreaterThan(fixedCount, 0)
 }
 
+
+// ═══════════════════════════════════════════════════════
+// Regression: 未知长度流的结束判定 + 迟到的 gapless swap
+// 两者都会让"播完不自动切下一曲"：前者 decoder.isAtEnd 永假（结束检测定时器
+// 永不触发），后者 swap 成功但解码线程已退出（静音且 onTrackFinished 不触发）。
+// ═══════════════════════════════════════════════════════
+print("\n═══ Regression: Unknown-Length EOS & Late Gapless Swap ═══")
+
+/// 复刻 libFLAC 对未知长度流（STREAMINFO.total_samples == 0）的行为：
+/// totalFrames 只是 Int64.max 哨兵，真正的末尾由解码器状态机（EOS）给出。
+final class QEosStubDecoder: AudioDecoder {
+    let format = AudioFormat(sampleRate: 44100, channels: 2, sampleFormat: .int16)
+    let totalFrames: Int64 = Int64.max
+    private(set) var currentFrame: Int64 = 0
+    private let limit: Int64
+    private var reachedEOS = false
+    var isAtEnd: Bool { reachedEOS }
+
+    init(frameLimit: Int64) { self.limit = frameLimit }
+
+    func decode(into buffer: UnsafeMutableRawPointer, maxFrames: Int) throws -> Int {
+        guard !reachedEOS else { return 0 }
+        let n = Int(min(Int64(maxFrames), max(0, limit - currentFrame)))
+        guard n > 0 else { reachedEOS = true; return 0 }
+        memset(buffer, 0x40, n * format.bytesPerFrame)
+        currentFrame += Int64(n)
+        return n
+    }
+    func seek(to frame: Int64) throws { reachedEOS = false; currentFrame = max(0, frame) }
+    func close() {}
+}
+
+runTest("trimmingDecoderHonoursInnerEndOfStream") {
+    // CUE 末轨 + 未知长度镜像：endFrame 未知 → Wrapper 无法靠帧数判定末尾
+    let stub = QEosStubDecoder(frameLimit: 20_000)
+    let trim = try TrimmingDecoder(inner: stub, startFrame: 0, endFrame: nil)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 4096 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    var total = 0, iterations = 0
+    while !trim.isAtEnd && iterations < 200 {
+        iterations += 1
+        let n = try trim.decode(into: buf, maxFrames: 4096)
+        if n == 0 { break }
+        total += n
+    }
+    try assertTrue(trim.isAtEnd, "底层 EOS 后 TrimmingDecoder 仍上报未结束")
+    try assertEqual(total, 20_000)
+}
+
+runTest("trimmingDecoderExplicitRangeStillTrims") {
+    // 上面的修复不得破坏 CUE 分轨的显式区间裁剪
+    let stub = QEosStubDecoder(frameLimit: 100_000)
+    let trim = try TrimmingDecoder(inner: stub, startFrame: 1_000, endFrame: 5_000)
+    try assertEqual(trim.totalFrames, 4_000)
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 8192 * 4, alignment: 16)
+    defer { buf.deallocate() }
+    var total = 0
+    while !trim.isAtEnd {
+        let n = try trim.decode(into: buf, maxFrames: 4096)
+        if n == 0 { break }
+        total += n
+    }
+    try assertEqual(total, 4_000)
+    try assertTrue(trim.isAtEnd)
+    try assertEqual(stub.currentFrame, 5_000)
+}
+
+runTest("gaplessSwapLongAfterEOFStillFeedsAudio") {
+    // 首曲静音：swap 之后 ring 里出现的非零样本只可能来自新 decoder
+    let first = SineDecoder(sampleRate: 44100, channels: 2, durationSeconds: 0.1,
+                            frequency: 440, amplitude: 0)
+    let out = MockAudioOutput()
+    let pipe = AudioPipeline(decoder: first, output: out)
+    try pipe.start()
+    let eofDeadline = Date().addingTimeInterval(2.0)
+    while Date() < eofDeadline && !first.isAtEnd { Thread.sleep(forTimeInterval: 0.01) }
+    try assertTrue(first.isAtEnd)
+    Thread.sleep(forTimeInterval: 0.6)   // 远超旧实现 0.25 s 后解码线程自杀的窗口
+
+    let next = SineDecoder(sampleRate: 44100, channels: 2, durationSeconds: 0.5,
+                           frequency: 1000, amplitude: 0.5)
+    try assertTrue(pipe.canSwapDecoder(next))
+    try pipe.swapDecoder(next)
+
+    try assertEqual(pipe.outputFormat.sampleFormat, .float32)
+    let bpf = pipe.outputFormat.bytesPerFrame
+    let buf = UnsafeMutableRawPointer.allocate(byteCount: 8192 * bpf, alignment: 16)
+    defer { buf.deallocate() }
+    var peak: Float = 0
+    let deadline = Date().addingTimeInterval(1.5)
+    while Date() < deadline && peak < 0.2 {
+        let n = pipe.ringBuffer.read(into: buf, length: 8192 * bpf)
+        guard n > 0 else { Thread.sleep(forTimeInterval: 0.01); continue }
+        let fp = buf.assumingMemoryBound(to: Float.self)
+        for i in 0..<(n / MemoryLayout<Float>.size) { peak = max(peak, abs(fp[i])) }
+    }
+    pipe.stop()
+    try assertGreaterThan(peak, Float(0.2))
+}
+
+
+// ═══════════════════════════════════════════════════════
+// Regression: playlist auto-advance at end of track
+// 以真实时间驱动输出（每秒拉走 sampleRate 帧）并抽空 main RunLoop，时序与
+// App 一致：ring 容量 2 s → 解码线程比输出早约 2 s 到达 EOF。
+// ═══════════════════════════════════════════════════════
+print("\n═══ Regression: Auto-Advance At Track End ═══")
+
+runTest("autoAdvanceToLocalNextTrack") {
+    AudioPreferences.hogEnabled = false
+    let fm = FileManager.default
+    func makeFile(_ frames: Int, _ tag: String) throws -> URL {
+        let url = fm.temporaryDirectory
+            .appendingPathComponent("pp_adv_\(tag)_\(UUID().uuidString).wav")
+        try WAVTestHelper.makePCM16Stereo(sampleRate: 44100,
+                                          durationFrames: frames).write(to: url)
+        return url
+    }
+    let f1 = try makeFile(13_230, "one")   // 0.3 s
+    let f2 = try makeFile(13_230, "two")
+    defer { try? fm.removeItem(at: f1); try? fm.removeItem(at: f2) }
+
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)
+    pc.playMode = .sequential
+    pc.isGaplessEnabled = false
+    pc.queue = [.local(f1), .local(f2)]
+
+    let lock = NSLock()
+    var finishedCount = 0
+    var playedIndexes: [Int] = []
+    pc.onTrackFinished = {
+        lock.lock(); finishedCount += 1; lock.unlock()
+        // 复刻 AppDelegate.advanceToNextTrack
+        DispatchQueue.main.async {
+            guard let next = pc.nextTrackIndex() else { pc.stop(); return }
+            lock.lock(); playedIndexes.append(next); lock.unlock()
+            try? pc.playFromQueue(index: next)
+        }
+    }
+
+    try pc.playFromQueue(index: 0)
+    let pace = 1024.0 / 44_100.0
+    let deadline = Date().addingTimeInterval(4.0)
+    while Date() < deadline {
+        out.pullFrames(1024, bytesPerFrame: 4)
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(pace))
+    }
+    lock.lock()
+    let finished = finishedCount
+    let played = playedIndexes
+    lock.unlock()
+    let endIndex = pc.currentTrackIndex
+    let endFramesRendered = out.framesRendered
+    pc.stop()
+
+    print("    [diag] onTrackFinished=\(finished) played=\(played) "
+          + "index=\(endIndex) framesRendered=\(endFramesRendered)")
+    try assertGreaterThan(finished, 0)
+    try assertEqual(played.last ?? -1, 1, "未自动播放下一曲")
+}
+
+runTest("autoAdvanceGaplessWithRealtimeDrain") {
+    AudioPreferences.hogEnabled = false
+    let fm = FileManager.default
+    func makeFile(_ frames: Int, _ tag: String) throws -> URL {
+        let url = fm.temporaryDirectory
+            .appendingPathComponent("pp_advgap_\(tag)_\(UUID().uuidString).wav")
+        try WAVTestHelper.makePCM16Stereo(sampleRate: 44100,
+                                          durationFrames: frames).write(to: url)
+        return url
+    }
+    // 2 s/曲 > ring 容量 2 s 的一半以上：解码线程会比输出早约 2 s 到达 EOF
+    let f1 = try makeFile(88_200, "one")
+    let f2 = try makeFile(88_200, "two")
+    defer { try? fm.removeItem(at: f1); try? fm.removeItem(at: f2) }
+
+    let out = MockAudioOutput()
+    let pc = PlayerController(output: out)
+    pc.playMode = .sequential
+    pc.queue = [.local(f1), .local(f2)]      // isGaplessEnabled 默认 true
+
+    let lock = NSLock()
+    let t0 = Date()
+    var finishedCount = 0
+    var changedTo: [(Int, Double)] = []
+    var finishedAt: [Double] = []
+    var playedIndexes: [Int] = []
+    pc.onTrackChanged = { idx in
+        lock.lock(); changedTo.append((idx, Date().timeIntervalSince(t0))); lock.unlock()
+    }
+    pc.onTrackFinished = {
+        lock.lock()
+        finishedCount += 1; finishedAt.append(Date().timeIntervalSince(t0))
+        lock.unlock()
+        DispatchQueue.main.async {
+            guard let next = pc.nextTrackIndex() else { pc.stop(); return }
+            lock.lock(); playedIndexes.append(next); lock.unlock()
+            try? pc.playFromQueue(index: next)
+        }
+    }
+
+    try pc.playFromQueue(index: 0)
+    // 真实时间拉帧：每秒 44100 帧，同时抽空 main RunLoop
+    let chunk = 4410
+    var nextFire = Date()
+    let deadline = Date().addingTimeInterval(6.0)
+    var nextSample = Date()
+    while Date() < deadline {
+        out.pullFrames(chunk, bytesPerFrame: 4)
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.002))
+        if Date() >= nextSample {
+            nextSample = Date().addingTimeInterval(0.1)
+            lock.lock()
+            let ch = changedTo.count, fin = finishedCount
+            lock.unlock()
+            print(String(format: "    t=%.2f frame=%d/%d rendered=%d playing=%d state=%@ und=%d ch=%d fin=%d",
+                         Date().timeIntervalSince(t0), pc.currentFrame, pc.totalFrames,
+                         out.framesRendered, out.isPlaying ? 1 : 0,
+                         "\(pc.state)", pc.underrunCount, ch, fin))
+        }
+        nextFire += TimeInterval(chunk) / 44_100.0
+        let wait = nextFire.timeIntervalSinceNow
+        if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+    }
+    lock.lock()
+    let finished = finishedCount, changed = changedTo, played = playedIndexes
+    let fins = finishedAt
+    lock.unlock()
+    let idx = pc.currentTrackIndex
+    let rendered = out.framesRendered
+    let st = pc.state
+    pc.stop()
+
+    print("    [gapless diag] finished=\(finished) at=\(fins) changed=\(changed) "
+          + "played=\(played) index=\(idx) state=\(st) rendered=\(rendered)/\(88_200 * 2)")
+    try assertTrue(changed.contains(where: { $0.0 == 1 }), "gapless 未衔接到下一曲 index=1")
+    // 尾部不得被切掉：两曲共 176_400 帧必须全部消费完才允许 stop。
+    // 旧实现在 decoder.isAtEnd 的首个 tick 就触发 onTrackFinished，
+    // 上层 stop() 重置 ring（容量 2 s）→ 末曲尾部近 2 s 静音消失。
+    try assertTrue(rendered >= 88_200 * 2, "末曲尾部被切掉：rendered=\(rendered)")
+}
 
 print("\n" + String(repeating: "═", count: 50))
 print("Tests: \(totalTests) total, \(passedTests) passed, \(failedTests) failed")

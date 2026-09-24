@@ -8,7 +8,7 @@ A SwiftPM package combining a Vox-inspired minimal dark UI with audiophile-grade
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  PurePlay  v1.7.1                                        │
+│  PurePlay  v1.7.2                                        │
 ├──────────────────────────────────────────────────────────┤
 │            ┌───────────────────────────────┐             │
 │            │                               │             │
@@ -245,6 +245,8 @@ Track → Source → Decoder → [DSPChain bypassed] → PCMRingBuffer → CoreA
 
 When the source is FLAC 24/96 and the DAC accepts 96 kHz: the decoded `int32` block is written into the ring buffer with zero conversion, and CoreAudio renders it through the bit-perfect path. `didMatchHardwareRate` becomes `true` and the SignalPathBar dot turns 🟢.
 
+The software volume slider intentionally has **no effect** on this direct path: any volume change would break bit-perfect integrity (issue #1), and the HAL `kHALOutputParam_Volume` is deliberately never set. To keep volume functional without sacrificing bit-perfect output, the player **auto-forces the DSP float path whenever the slider drops below 100%**, then restores the untouched bit-perfect path again at 100% volume. So: 100% = genuine bit-perfect; anything less = software volume actually applied.
+
 ### DSP path (only when user opts in)
 
 ```
@@ -252,6 +254,8 @@ Decoder → int→float → ReplayGain → Resampler → EQ → Crossfeed → Di
 ```
 
 DSPChain.build assembles only the enabled nodes; everything is skipped in bit-perfect mode. DSD sources override the preferences and always take the bypassed path, because DSP would corrupt DoP marker bytes.
+
+Software volume is applied in this float domain via `VolumeCurve.linearGain(slider:)` (slider 0…1 → −60 dB…0 dB). When the slider is below 100%, the pipeline forces the float path even in otherwise-bit-perfect playback so the volume actually scales the samples; at 100% it returns to the untouched direct path for true bit-perfect output.
 
 ### Gapless
 
@@ -619,6 +623,7 @@ localplayer/
 | v1.6  | ✅      | Parametric EQ engine (20 bands, LP/HP, click-free coefficient interpolation) · DSD1024 + `dsdMaxPCMRate` · EQ A/B slot persistence + v1.5 migration · AutoEQ import + headphone chip · spectrum axis fix + asymmetric smoothing · WMA/MKA via FFmpeg |
 | v1.7  | ✅      | DTS (DCA) playback via FFmpeg, local + cloud file picker DTS support, LocalizedError, proper app bundle Info.plist + app icon, extension-based audio file filters, version-stable builds |
 | v1.7.1| ✅      | Fix cloud track next/previous switching error (I/O error: Cloud tracks require async playback) in main window + mini player |
+| v1.7.2| ✅      | Fix control-panel volume slider (issue #1): volume < 100% forces the DSP float path so software volume actually applies; 100% keeps true bit-perfect |
 | Next  | ⏳      | EQ polish: spectrum overlay on the EQ canvas, double-click numeric entry with unit parsing, Option-drag Q, A/B slot switch UI |
 | Next  | ⏳      | Unsupported-codec grayout (tooltip + auto-skip) · FFmpeg metadata fallback for WMA/MKA tags + covers · audio-thread performance HUD |
 | Next  | ⏳      | taglib integration replacing AVAsset metadata reader        |

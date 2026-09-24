@@ -19,6 +19,14 @@ public final class CoreAudioDecoder: AudioDecoder {
     private let skipDelayFrames: Int64
     private var pendingSkipFrames: Int64 = 0
 
+    /// Apple 的 FLAC 解码器实际可解出的样本数恒小于
+    /// kExtAudioFileProperty_FileLengthFrames（STREAMINFO total_samples）
+    /// 报出的标称值 — 尾部有一小段（几千~几万帧）Apple 不再产出。
+    /// 旧实现 isAtEnd = currentFrame >= totalFrames，于是 currentFrame 永远
+    /// 追不上 totalFrames → 结束检测永不触发 → 不自动切歌、尾部下溢。
+    /// 与 LibFLAC/FFmpeg 同理，以 ExtAudioFileRead 返回 < 请求数（EOF）为准。
+    private var reachedEndOfStream = false
+
     /// FLAC MD5 校验（仅当源为 FLAC 且 STREAMINFO 含非零 MD5 时启用）
     private var md5Verifier: FLACMD5Verifier?
     private var expectedMD5: [UInt8]?
@@ -31,7 +39,7 @@ public final class CoreAudioDecoder: AudioDecoder {
         case mismatch(expected: [UInt8], actual: [UInt8])
     }
 
-    public var isAtEnd: Bool { currentFrame >= totalFrames }
+    public var isAtEnd: Bool { reachedEndOfStream || currentFrame >= totalFrames }
 
     public init(url: URL, verifyFLACMD5: Bool = false) throws {
         var fileRef: ExtAudioFileRef?
@@ -102,6 +110,12 @@ public final class CoreAudioDecoder: AudioDecoder {
         let srcIsFloat = (srcFlags & kAudioFormatFlagIsFloat) != 0
         let srcBitDepth = Int(fileFormat.mBitsPerChannel)  // 通常 16 / 24 / 32
 
+        // FLAC：Apple 的 FileDataFormat 把源报成 32-bit float 容器
+        // （srcBitDepth=32, srcIsFloat=true），位深/整数判定被浮点化掩盖。
+        // 用 STREAMINFO 拿真实位深与采样数，供显示与 EOS 判定使用。
+        let isFLAC = url.pathExtension.lowercased() == "flac"
+        let flacInfo = isFLAC ? ((try? FLACMetadata.read(from: url)) ?? nil)?.streamInfo : nil
+
         // issue #14：整数源按**原生位深**容器投递（16→int16 packed、
         // 24→int24 packed 3 字节、其余/未知→int32），不再一律升 int32 —
         // 否则 setPhysicalFormat 把 DAC 设成 32-bit 物理格式，16-bit CD 抓轨
@@ -154,17 +168,18 @@ public final class CoreAudioDecoder: AudioDecoder {
             throw PurePlayError.decodeFailed("Cannot set client format: \(setStatus)")
         }
 
-        // bitDepth 报源原生位深；srcBitDepth==0 时回落到容器位深
-        let reportedSrcBits: Int? = srcBitDepth > 0 ? srcBitDepth : nil
+        // bitDepth 报源原生位深；FLAC 用 STREAMINFO 的真实位深（24-bit
+        // 源不会被 Apple 的 32-bit float 容器谎报成 32-bit）；srcBitDepth==0
+        // 时回落到容器位深
+        let effectiveSrcBits = flacInfo?.bitsPerSample ?? srcBitDepth
+        let reportedSrcBits: Int? = effectiveSrcBits > 0 ? effectiveSrcBits : nil
         self.format = AudioFormat(sampleRate: sampleRate,
                                    channels: Int(channels),
                                    sampleFormat: chosenSampleFormat,
                                    sourceBitDepth: reportedSrcBits)
 
         // FLAC MD5 校验（按需启用）：解析 STREAMINFO，取其内嵌 MD5
-        if verifyFLACMD5, url.pathExtension.lowercased() == "flac",
-           let parsed = (try? FLACMetadata.read(from: url)) ?? nil {
-            let info = parsed.streamInfo
+        if verifyFLACMD5, isFLAC, let info = flacInfo {
             if info.hasMD5 {
                 self.expectedMD5 = info.md5Signature
                 self.md5Verifier = FLACMD5Verifier(bitsPerSample: info.bitsPerSample,
@@ -254,6 +269,12 @@ public final class CoreAudioDecoder: AudioDecoder {
             throw PurePlayError.decodeFailed("ExtAudioFileRead failed: \(status)")
         }
         currentFrame += Int64(framesRead)
+        // Apple FLAC 解码器产出的帧数恒少于 FileLengthFrames 标称值 —
+        // 当次返回 < 请求数即已到 EOF（issue #5: 否则 currentFrame 追不上
+        // totalFrames，isAtEnd 永假，不自动切歌且尾部下溢）。
+        if framesToRead > 0 && framesRead < framesToRead {
+            reachedEndOfStream = true
+        }
 
         // FLAC MD5 增量更新
         // issue #12：Apple 的 ExtAudioFile FLAC 解码以 float32 容器投递 —
@@ -303,6 +324,7 @@ public final class CoreAudioDecoder: AudioDecoder {
         }
         currentFrame = clamped
         pendingSkipFrames = 0
+        reachedEndOfStream = false
     }
 
     public func close() {

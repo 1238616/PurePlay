@@ -24,7 +24,12 @@ public final class LibFLACDecoder: AudioDecoder {
     public private(set) var format: AudioFormat
     public private(set) var totalFrames: Int64
     public private(set) var currentFrame: Int64 = 0
-    public var isAtEnd: Bool { currentFrame >= totalFrames }
+    /// 未知长度流（STREAMINFO.total_samples == 0）的 totalFrames 是 Int64.max
+    /// 哨兵值，`currentFrame >= totalFrames` 永远为假 — 只靠帧数比较会让
+    /// 上层结束检测永不触发（不自动切歌），且解码线程会在 EOS 后空转。
+    /// 与 FFmpegDecoder 同理，以 libFLAC 状态机的 END_OF_STREAM 为准。
+    private var reachedEndOfStream = false
+    public var isAtEnd: Bool { reachedEndOfStream || currentFrame >= totalFrames }
 
     private let source: AudioSource
     private var decoderRef: UnsafeMutablePointer<FLAC__StreamDecoder>?
@@ -163,6 +168,7 @@ public final class LibFLACDecoder: AudioDecoder {
             pendingChannelOffset = 0
             if FLAC__stream_decoder_get_state(dec)
                 == FLAC__STREAM_DECODER_END_OF_STREAM {
+                reachedEndOfStream = true
                 break
             }
             if FLAC__stream_decoder_process_single(dec) == 0 {
@@ -171,6 +177,11 @@ public final class LibFLACDecoder: AudioDecoder {
             }
             if pendingCount == 0 {
                 // process_single 成功但无输出：EOS 或 metadata-only frame
+                // （后者 libFLAC 不会置 END_OF_STREAM，故按状态判定）
+                if FLAC__stream_decoder_get_state(dec)
+                    == FLAC__STREAM_DECODER_END_OF_STREAM {
+                    reachedEndOfStream = true
+                }
                 break
             }
         }
@@ -181,6 +192,7 @@ public final class LibFLACDecoder: AudioDecoder {
 
     public func seek(to frame: Int64) throws {
         guard let dec = decoderRef else { return }
+        reachedEndOfStream = false
         let clamped = totalFrames == Int64.max ? max(0, frame)
                                              : max(0, min(frame, totalFrames))
         let target = UInt64(clamped)

@@ -238,7 +238,10 @@ public final class TrimmingDecoder: AudioDecoder {
     public private(set) var currentFrame: Int64 = 0
 
     public var format: AudioFormat { inner.format }
-    public var isAtEnd: Bool { currentFrame >= totalFrames }
+    /// 未知长度的 CUE 镜像（如 total_samples == 0 的 FLAC）没有可用的
+    /// inner.totalFrames，末尾分轨的 totalFrames 只是估算 — 底层真正读完
+    /// 也必须上报结束，否则永远不会自动切下一曲
+    public var isAtEnd: Bool { currentFrame >= totalFrames || inner.isAtEnd }
 
     public init(inner: AudioDecoder, startFrame: Int64, endFrame: Int64?) throws {
         self.inner = inner

@@ -29,10 +29,13 @@ public final class SincResampler {
 
     private let table: [Float]   // 长度 = tableSize
     private let stepRatio: Double  // = inputRate / outputRate
-    /// 历史样本缓冲，每声道独立；长度 = 2 × zeroCrossings + 一些 head room
+    /// 历史样本缓冲，每声道独立；长度 = keep（= 2 × zeroCrossings + 4）
     private var history: [[Float]]
-    /// 累积小数相位（"虚拟"输入索引相对 history 开头）
-    private var phase: Double = 0
+    /// 已解码的输入样本总数（绝对坐标下一条新输入从哪个位置开始）。
+    /// 用于跨块连续相位的绝对坐标基准。
+    private var decodedInputCount: Int = 0
+    /// 下一输出样本的绝对输入坐标（含小数部分）。
+    private var absPhase: Double = 0
     /// 可复用的工作缓冲（避免每次 process 分配）
     private var workBuffer: [[Float]] = []
 
@@ -55,7 +58,8 @@ public final class SincResampler {
         for c in 0..<channels {
             for i in 0..<history[c].count { history[c][i] = 0 }
         }
-        phase = 0
+        absPhase = 0
+        decodedInputCount = 0
     }
 
     /// 估算给定输入帧数对应能产出的最大输出帧数（含安全余量）
@@ -80,9 +84,11 @@ public final class SincResampler {
         let zc = Self.zeroCrossings
         let phasesN = Self.phasesPerZeroCrossing
         let phasesD = Double(phasesN)
+        let keep = 2 * zc + 4
 
-        // 复用 workBuffer（仅在容量不足时扩容）
-        let totalSamples = history[0].count + inputFrames
+        // 工作缓冲 = history(keep) + 新输入。workBuffer[c][i] 对应绝对输入
+        // 坐标 (decodedInputCount - keep) + i。
+        let totalSamples = keep + inputFrames
         if workBuffer.count < channels {
             workBuffer = Array(repeating: [Float](repeating: 0, count: totalSamples), count: channels)
         }
@@ -93,36 +99,27 @@ public final class SincResampler {
             let h = history[c]
             for i in 0..<h.count { workBuffer[c][i] = h[i] }
             for i in 0..<inputFrames {
-                workBuffer[c][h.count + i] = input[i * channels + c]
+                workBuffer[c][keep + i] = input[i * channels + c]
             }
         }
 
-        // 当前 phase 是相对于 history 起点的浮点索引。
-        // 一次循环：取 phase 中央 index，左右各 zc 个原始样本卷积窗口，
-        // 推进 phase += stepRatio，直到右边没有 zc 个样本可用为止。
-        var outFrames = 0
-        let needLeft = zc - 1
-        var p = phase + Double(history[0].count - needLeft)   // 把 history 末端当成"边界"
+        // 绝对输入坐标 → 工作缓冲坐标。
+        let workOrigin = Double(decodedInputCount - keep)
+        var p = absPhase - workOrigin   // 下一个待产出输出在 work 坐标中的位置
 
+        var outFrames = 0
+        // 窗口 [baseIdx-zc+1, baseIdx+zc] 需完整落在 [0, totalSamples-1]。
+        let maxBase = totalSamples - 1 - zc
         while outFrames < outputCapacityFrames {
             let baseIdx = Int(p.rounded(.down))
-            // 需要 baseIdx-zc+1 .. baseIdx+zc，全部在 work 范围内
-            let left = baseIdx - zc + 1
-            let right = baseIdx + zc
-            if right >= totalSamples { break }
-            if left < 0 { break }
+            if baseIdx < zc - 1 { break }          // 左边界不足（仅启动期）
+            if baseIdx > maxBase { break }         // 右边界不足
+            let frac = p - Double(baseIdx)         // [0, 1)
 
-            let frac = p - Double(baseIdx)           // [0, 1)
-            // 多相表索引：以 frac 选择 sub-phase
-            // 表布局：table[i] 对应 t = (i - coefHalf) / phasesN
-            // 对应输入相对偏移 dx = (i - coefHalf)/phasesN - frac
-            // 我们直接遍历 -zc+1..zc：
             for c in 0..<channels {
                 var acc: Float = 0
                 for n in (-(zc - 1))...zc {
-                    // 对应输入索引 = baseIdx + n
                     let idx = baseIdx + n
-                    // t = n - frac → 系数索引 = (t + zc) * phasesN
                     let t = Double(n) - frac
                     let tableIdxF = (t + Double(zc)) * phasesD
                     let tableIdx = Int(tableIdxF.rounded(.toNearestOrEven))
@@ -140,18 +137,17 @@ public final class SincResampler {
             p += stepRatio
         }
 
-        // 更新 history：保留最末 2*zc 个样本
-        let keep = 2 * zc + 4
+        // 更新 history：保留最末 keep 个样本（绝对坐标尾段）。
         for c in 0..<channels {
-            let total = workBuffer[c].count
-            let start = max(0, total - keep)
+            let start = totalSamples - keep
             for i in 0..<keep {
                 history[c][i] = workBuffer[c][start + i]
             }
         }
-        // 推进 phase：新 history 起点 = (旧 history 长度 + inputFrames - keep)
-        // 让 p 重新对齐：减去 keep 偏移
-        phase = p - Double(history[0].count - needLeft) - Double(inputFrames - keep)
+
+        // 推进绝对坐标。p 当前停在下一个未产出输出的 work 坐标；恢复成绝对坐标。
+        absPhase = p + workOrigin
+        decodedInputCount += inputFrames
         return outFrames
     }
 

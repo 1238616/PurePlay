@@ -436,24 +436,22 @@ public final class AudioPipeline {
             decoderAtEndFlag.store(atEnd, ordering: .relaxed)
 
             if atEnd {
+                // 曲尾：等待上层无缝衔接（swapDecoder）或管线停止。
+                // 结束检测定时器跑在 main runloop 上，UI 繁忙 / 下一曲打开
+                // 较慢时 swap 可能远晚于 0.25s —— 若这里提前退出线程，swap
+                // 成功后无人向 ring 供数据：表现为静音、state 卡在 .playing、
+                // onTrackFinished 永不触发（不自动切歌）。
                 let currentDecoderID = ObjectIdentifier(currentDecoder)
-                let graceWindow: TimeInterval = 0.25
-                let step: TimeInterval = 0.01
-                var waited: TimeInterval = 0
-                while waited < graceWindow {
-                    Thread.sleep(forTimeInterval: step)
-                    waited += step
+                var swapped = false
+                while isRunning && !Thread.current.isCancelled {
+                    Thread.sleep(forTimeInterval: 0.02)
                     seekLock.lock()
-                    let swapped = ObjectIdentifier(decoder) != currentDecoderID
+                    swapped = ObjectIdentifier(decoder) != currentDecoderID
                     seekLock.unlock()
                     if swapped { break }
-                    if !isRunning || Thread.current.isCancelled { break }
                 }
-                seekLock.lock()
-                let finalSwapped = ObjectIdentifier(decoder) != currentDecoderID
-                seekLock.unlock()
-                if !finalSwapped {
-                    break   // 无人接力，正常结束
+                if !swapped {
+                    break   // 无人接力：管线已停止，正常收尾
                 }
                 continue
             }
